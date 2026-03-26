@@ -1,86 +1,56 @@
 # AIVPN
 
-**Next-generation VPN that makes your traffic invisible to deep packet inspection.**
+Traditional VPNs are dead. ISPs and state-level firewalls (like GFW) detect WireGuard and OpenVPN in milliseconds just by looking at packet sizes, timing intervals, and handshake patterns. You can encrypt your payload with whatever cipher you want — DPI systems don't care about the content, they block the *shape* of the connection itself.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/lang-Rust-orange?style=flat-square&logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/version-0.3.0-blue?style=flat-square" alt="Version">
-  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/tests-113%20passed-brightgreen?style=flat-square" alt="Tests">
-  <img src="https://img.shields.io/badge/binary-~2.5MB-lightgrey?style=flat-square" alt="Size">
-</p>
+**AIVPN** is my answer to modern deep packet inspection. We don't just encrypt packets — we disguise them as real application traffic. Your ISP sees a Zoom call or TikTok scrolling, when in reality it's a fully encrypted tunnel.
 
----
+## Supported Platforms
 
-AIVPN doesn't just encrypt your traffic — it makes it **indistinguishable from ordinary internet activity**. To any observer, including state-level deep packet inspection systems, your connection looks like a regular video call, web browsing, or any other everyday application. No headers to fingerprint. No handshake to detect. No pattern to match.
+| Platform | Server | Client | Full Tunnel | Notes |
+|----------|--------|--------|-------------|-------|
+| **Linux** | ✅ | ✅ | ✅ | Primary platform, TUN via `/dev/net/tun` |
+| **macOS** | — | ✅ | ✅ | Via `utun` kernel interface, auto route config |
+| **Windows** | — | ✅ | ✅ | Via [Wintun](https://www.wintun.net/) driver |
 
-## Why Existing VPNs Get Blocked
+## The Main Feature: Neural Resonance (AI)
 
-Every mainstream VPN protocol — OpenVPN, WireGuard, Shadowsocks — has a fingerprint. Encrypt all you want, the traffic *shape* still betrays you: packet sizes are too uniform, timing is too regular, handshakes follow a detectable sequence. Modern DPI systems with ML classifiers catch these patterns in seconds.
+The most interesting thing under the hood is our AI module called **Neural Resonance**.
+We didn't drag a 400 MB LLM into the project that would eat all the RAM on a cheap VPS. Instead:
 
-AIVPN solves this at the protocol level:
+- **Baked Mask Encoder:** For each mask profile (WebRTC codec, QUIC protocol) we trained and "baked" a micro neural network (MLP 64→128→64) directly into the binary. It weighs only ~66 KB!
+- **Real-time analysis:** This neural net analyzes entropy and IAT (inter-arrival times) of incoming UDP packets on the fly.
+- **Hunting censors:** If the ISP's DPI system tries to probe our server (Active Probing) or starts throttling packets, the neural module detects a spike in reconstruction error (MSE).
+- **Auto mask rotation:** As soon as the AI determines the current mask is compromised (e.g. `webrtc_zoom` got flagged), the server and client *seamlessly* reshape traffic to a backup mask (e.g. `dns_over_udp`). Zero disconnects!
 
-| | Traditional VPN | AIVPN |
-|---|---|---|
-| **Connection** | Detectable handshake phase | Zero-RTT — first packet carries data |
-| **Headers** | Known structure / magic bytes | Dynamic per-session — nothing to match |
-| **Traffic shape** | Uniform, machine-like | Mimics real apps (video calls, HTTPS) |
-| **Active probes** | Server responds with errors | Complete silence — invisible to scanners |
-| **If source code leaks** | Protocol is compromised | No effect — security is in keys, not code |
-| **If server is seized** | Past traffic decryptable | Protected — Perfect Forward Secrecy |
+## Other Cool Stuff
 
-## Key Features
+- **Zero-RTT & PFS:** No classic handshake for sniffers to catch. Data flows from the very first packet. And Perfect Forward Secrecy is built in — keys rotate on the fly, so even if the server gets seized, old traffic dumps can't be decrypted.
+- **O(1) cryptographic session tags:** We never transmit a session ID in the clear. Instead, every packet carries a dynamic cryptographic tag derived from a timestamp and a secret key. The server finds the right client instantly, but to any observer it's just noise.
+- **Written in Rust:** Fast, memory-safe, no leaks. The entire client binary is ~2.5 MB. Runs comfortably on a $5 VPS.
 
-- **Adaptive Traffic Mimicry** — every session shapeshifts to match a real application's traffic profile
-- **Zero-RTT Start** — no handshake for censors to fingerprint; data flows from the first packet
-- **Perfect Forward Secrecy** — ephemeral key ratchet; compromising a server reveals nothing about past sessions
-- **Silent Server** — looks like a closed port to anyone without valid credentials
-- **Cryptographic Server Auth** — prevents man-in-the-middle even on a fully hostile network
-- **O(1) Packet Routing** — constant-time session identification via rotating cryptographic tags
-- **Memory-Safe** — pure Rust with zero `unsafe` code; all key material auto-zeroed on drop
-- **Tiny Footprint** — client ~2.4 MB, server ~2.6 MB, runs comfortably on a $5 VPS
+## Getting Started
 
-### What's New in 0.3.0
-
-- **Neural Resonance (Baked Mask Encoder)** — each mask gets a dedicated micro-neural-network (MLP 64→128→64, ~66 KB per mask) that detects DPI compromise via traffic reconstruction error. No external models — pure Rust, runs on any VPS.
-- **Automatic Mask Rotation** — when DPI compromises a mask, the session instantly switches to a fallback mask from the catalog without dropping the connection.
-- **Mask Catalog with Fallback Pool** — register multiple masks, monitor their status, automatically select the best available mask.
-- **Anomaly Detector** — monitors packet loss and RTT per mask; a spike in metrics signals DPI interference.
-- **Encryption Key Rotation** — automatic session key rotation by timer (120s) and data volume (1 MB).
-- **Prometheus Metrics** — optional monitoring module (feature flag `metrics`).
-
-## Quick Start
-
-### Requirements
-
-- **Rust 1.75+** — [rustup.rs](https://rustup.rs/)
-- **Linux** with TUN/TAP support (server and client)
-- **macOS** supported for client and development
-- **Root access** required for TUN device and NAT
-
-### Build
+### 1. Clone the repo
 
 ```bash
-git clone <repo-url> && cd aivpn
+git clone https://github.com/infosave2007/aivpn.git
+cd aivpn
+```
 
-# Build optimized release binaries
+### 2. Build (requires Rust 1.75+)
+
+The project is split into workspaces: `aivpn-common` (crypto & masks), `aivpn-server`, and `aivpn-client`.
+
+```bash
+# Same command on all platforms:
 cargo build --release
-
-# Or use the build script
-./build.sh
 ```
 
-### Run Tests
+> On Windows, make sure you have [Wintun](https://www.wintun.net/) installed — download `wintun.dll` and place it next to the binary.
 
-```bash
-cargo test    # 113 tests: crypto, protocol, mimicry, neural resonance, mask rotation, anomaly, keys, stress
-```
+### 3. Server (Linux only)
 
----
-
-## Server Setup
-
-### 1. Generate Server Key
+SSH into your VPS, generate a key:
 
 ```bash
 sudo mkdir -p /etc/aivpn
@@ -88,146 +58,129 @@ openssl rand 32 | sudo tee /etc/aivpn/server.key > /dev/null
 sudo chmod 600 /etc/aivpn/server.key
 ```
 
-### 2. Start Server
+Start it up:
 
 ```bash
-sudo ./target/release/aivpn-server \
-    --listen 0.0.0.0:443 \
-    --key-file /etc/aivpn/server.key
+sudo ./target/release/aivpn-server --listen 0.0.0.0:443 --key-file /etc/aivpn/server.key
 ```
 
-The server logs its **public key** on startup — share it with clients.
-
-| Flag | Default | Description |
-|---|---|---|
-| `--listen` | `0.0.0.0:443` | UDP listen address and port |
-| `--key-file` | — | Path to 32-byte server private key |
-| `--tun-name` | auto | TUN interface name (randomized by default) |
-| `--config` | — | Path to JSON config file |
-
-### 3. Enable NAT
+Enable NAT:
 
 ```bash
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
 ```
 
-### Server Config (optional)
-
-`/etc/aivpn/server.json`:
-```json
-{
-  "listen_addr": "0.0.0.0:443",
-  "tun_addr": "10.0.0.1",
-  "tun_netmask": "255.255.255.0",
-  "max_sessions": 500,
-  "session_timeout_secs": 86400
-}
-```
-
----
-
-## Client Setup
-
-```bash
-sudo ./target/release/aivpn-client \
-    --server YOUR_SERVER_IP:443 \
-    --server-key BASE64_SERVER_PUBLIC_KEY
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--server` | — | Server address (`ip:port`) |
-| `--server-key` | — | Server public key (base64, 32 bytes) |
-| `--tun-name` | auto | TUN interface name |
-| `--tun-addr` | `10.0.0.2` | Client tunnel IP |
-| `--config` | — | Path to JSON config file |
-
-### Client Config (optional)
-
-```json
-{
-  "server_addr": "YOUR_SERVER_IP:443",
-  "server_public_key": "BASE64_KEY",
-  "tun_addr": "10.0.0.2",
-  "tun_netmask": "255.255.255.0"
-}
-```
-
----
-
-## Docker Deployment
+Or use Docker (everything is already configured in `docker-compose.yml`):
 
 ```bash
 docker-compose up -d
-docker-compose logs -f aivpn-server
 ```
 
-Runs with `NET_ADMIN`, optimized sysctls, and 800 MB memory limit.
+### 4. Client
 
----
+On startup, the server prints its public key to the console. Copy it and plug it into the client command:
 
-## How It Works
+#### Linux
 
-```
-  Your traffic                                         Internet
-      |                                                   ^
-      v                                                   |
-+-----------+      indistinguishable     +-----------+    |
-|  AIVPN    | ==== from normal UDP ====> |  AIVPN    |----+
-|  Client   |       (Zoom, HTTPS...)     |  Server   |
-+-----------+                            +-----------+
+```bash
+sudo ./target/release/aivpn-client \
+    --server YOUR_VPS_IP:443 \
+    --server-key SERVER_PUBLIC_KEY_BASE64
 ```
 
-1. Client captures IP packets from a TUN device, encrypts them, and reshapes the traffic to look like a specific real-world application
-2. Each packet carries a **rotating cryptographic tag** that changes every packet and looks like random bytes to any observer
-3. The server identifies sessions via O(1) hash lookup and is completely silent to everything else
-4. On connection, an automatic **key ratchet** establishes forward secrecy — old keys are destroyed, past traffic stays safe
+Full tunnel mode (route all traffic through VPN):
 
-## Security
+```bash
+sudo ./target/release/aivpn-client \
+    --server YOUR_VPS_IP:443 \
+    --server-key SERVER_PUBLIC_KEY_BASE64 \
+    --full-tunnel
+```
 
-| Property | Detail |
-|---|---|
-| Encryption | ChaCha20-Poly1305 AEAD, every packet |
-| Key Exchange | X25519 with clamping and constant-time operations |
-| Forward Secrecy | Ephemeral key ratchet, keys zeroized after use |
-| Server Auth | Ed25519 signature verification |
-| Anti-Replay | 256-bit sliding window bitmap + monotonic counters |
-| Key Hygiene | `ZeroizeOnDrop` on all secrets, `OsRng` for keygen |
-| Rate Limiting | Per-IP session limits, connection throttling |
-| Neural Resonance | Baked Mask Encoder — ~66 KB per mask instead of ~400 MB LLM |
-| Auto-Rotation | Mask compromise → instant fallback switch |
-| Key Rotation | By timer and data volume, BLAKE3 key derivation |
+#### macOS
 
-The codebase has been hardened through a comprehensive internal security audit. All critical and high-severity findings have been addressed.
+Same deal, `cargo build --release` produces a native binary:
+
+```bash
+sudo ./target/release/aivpn-client \
+    --server YOUR_VPS_IP:443 \
+    --server-key SERVER_PUBLIC_KEY_BASE64
+```
+
+> macOS will auto-configure the `utun` interface and routes via `ifconfig` / `route`.
+
+#### Windows
+
+Download `wintun.dll` from [WireGuard/wintun](https://www.wintun.net/) and place it next to the `.exe`:
+
+```
+aivpn-client.exe
+wintun.dll
+```
+
+Run from PowerShell **as Administrator**:
+
+```powershell
+.\aivpn-client.exe --server YOUR_VPS_IP:443 --server-key SERVER_PUBLIC_KEY_BASE64
+```
+
+Full tunnel:
+
+```powershell
+.\aivpn-client.exe --server YOUR_VPS_IP:443 --server-key SERVER_PUBLIC_KEY_BASE64 --full-tunnel
+```
+
+> The client auto-configures routes via `route add` and cleans them up on exit.
+
+## Cross-compilation
+
+Build the client for any platform from your current machine:
+
+```bash
+# Linux target from macOS/Windows
+rustup target add x86_64-unknown-linux-gnu
+cargo build --release --target x86_64-unknown-linux-gnu
+
+# Windows target from Linux/macOS
+rustup target add x86_64-pc-windows-msvc
+cargo build --release --target x86_64-pc-windows-msvc
+```
 
 ## Project Structure
 
 ```
 aivpn/
-├── aivpn-common/       # Shared crypto, protocol, and mask engine
-├── aivpn-client/       # VPN client binary
-├── aivpn-server/       # VPN server binary
-│   ├── gateway.rs      #   UDP gateway, MaskCatalog, resonance loop
-│   ├── neural.rs       #   Baked Mask Encoder, AnomalyDetector
-│   ├── key_rotation.rs #   Session key rotation
-│   ├── metrics.rs      #   Prometheus monitoring (optional)
-│   └── passive_distribution.rs  # Passive mask distribution
-├── config/             # Example configurations
-├── Dockerfile          # Multi-stage production build
-├── docker-compose.yml  # Container deployment
-├── build.sh            # Release build script
-└── setup.sh            # Dev environment setup
+├── aivpn-common/src/
+│   ├── crypto.rs        # X25519, ChaCha20-Poly1305, BLAKE3
+│   ├── mask.rs          # Mimicry profiles (WebRTC, QUIC, DNS)
+│   └── protocol.rs      # Packet format, inner types
+├── aivpn-client/src/
+│   ├── client.rs        # Core client logic
+│   ├── tunnel.rs        # TUN interface (Linux / macOS / Windows)
+│   └── mimicry.rs       # Traffic shaping engine
+├── aivpn-server/src/
+│   ├── gateway.rs       # UDP gateway, MaskCatalog, resonance loop
+│   ├── neural.rs        # Baked Mask Encoder, AnomalyDetector
+│   ├── nat.rs           # NAT forwarder (iptables)
+│   ├── key_rotation.rs  # Session key rotation
+│   └── metrics.rs       # Prometheus monitoring
+├── Dockerfile
+├── docker-compose.yml
+└── build.sh
 ```
 
 ## Contributing
 
-```bash
-cargo test && cargo clippy --all-targets
-```
+Want to dig into the code or train your own mask for the neural module? Jump in:
 
-PRs welcome. Run the full suite before submitting.
+- Mask engine: [`aivpn-common/src/mask.rs`](aivpn-common/src/mask.rs)
+- Neural weights & anomaly detector: [`aivpn-server/src/neural.rs`](aivpn-server/src/neural.rs)
+- Cross-platform TUN module: [`aivpn-client/src/tunnel.rs`](aivpn-client/src/tunnel.rs)
+- Tests (100+): `cargo test`
 
-## License
+PRs are welcome! We're especially looking for people with traffic analysis experience to capture dumps from popular apps and train new profiles for Neural Resonance.
 
-MIT
+---
+
+License — MIT. Use it, fork it, bypass censorship responsibly.

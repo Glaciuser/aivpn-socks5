@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AIVPN</string>
+    <string name="subtitle">Neural Resonance VPN</string>
+    <string name="status_disconnected">Disconnected</string>
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_connected">Connected to %s</string>
+    <string name="status_error">Error: %s</string>
+    <string name="btn_connect">Connect</string>
+    <string name="btn_disconnect">Disconnect</string>
+    <string name="hint_server">Server address</string>
+    <string name="hint_server_example">e.g. 1.2.3.4:443</string>
+    <string name="hint_server_key">Server public key (Base64)</string>
+    <string name="error_fill_fields">Fill in server address and key</string>
+    <string name="error_vpn_denied">VPN permission denied</string>
+    <string name="error_invalid_key">Invalid key (need 32 bytes)</string>
+    <string name="error_handshake">Handshake failed</string>
+    <string name="label_upload">Upload</string>
+    <string name="label_download">Download</string>
+    <string name="label_duration">Duration</string>
+    <string name="version_footer">v0.3.0 · AI-powered DPI evasion</string>
+    <string name="notification_channel">AIVPN Tunnel</string>
+    <string name="notification_channel_desc">Active VPN tunnel status</string>
+    <string name="notification_connecting">Connecting…</string>
+    <string name="notification_connected">Connected to %s</string>
+    <string name="label_language">Language</string>
+</resources>

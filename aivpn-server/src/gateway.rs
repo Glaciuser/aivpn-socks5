@@ -571,18 +571,12 @@ impl Gateway {
                 inner_payload.extend_from_slice(&encoded);
                 let packet = self.build_packet(&inner_payload, &session)?;
                 let socket = self.udp_socket.as_ref().unwrap();
-                socket.send_to(&packet, client_addr).await?;
+                let sent = socket.send_to(&packet, client_addr).await?;
+                debug!("ServerHello sent: {} bytes to {}", sent, client_addr);
             }
             
-            // Complete PFS ratchet immediately after sending ServerHello
-            // so that TUN read loop uses ratcheted keys (matching client side)
-            {
-                let session_id = session.lock().session_id;
-                self.session_manager.complete_session_ratchet(&session_id);
-                // Refresh tag_map so server recognizes client's ratcheted tags
-                self.session_manager.refresh_session_tags(&session_id);
-                info!("PFS ratchet complete for {} (post-ServerHello)", hash_addr(&client_addr));
-            }
+            // NOTE: PFS ratchet is deferred until AFTER decrypting the init packet,
+            // which was encrypted with pre-ratchet keys.
             
             is_new_session = true;
             info!("New session from {} (ServerHello sent)", hash_addr(&client_addr));
@@ -616,8 +610,13 @@ impl Gateway {
             decrypt_payload(key, &nonce, encrypted_payload)?
         };
         
-        // If this packet used ratcheted keys, complete the PFS ratchet
-        if is_ratcheted_tag {
+        // Complete PFS ratchet after decrypting the init packet
+        if is_new_session {
+            let session_id = session.lock().session_id;
+            self.session_manager.complete_session_ratchet(&session_id);
+            self.session_manager.refresh_session_tags(&session_id);
+            info!("PFS ratchet complete for {} (post-ServerHello)", hash_addr(&client_addr));
+        } else if is_ratcheted_tag {
             let session_id = session.lock().session_id;
             self.session_manager.complete_session_ratchet(&session_id);
             info!("PFS ratchet complete for {}", hash_addr(&client_addr));

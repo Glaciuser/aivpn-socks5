@@ -101,7 +101,6 @@ impl AivpnClient {
         self.tunnel.set_server_ip(server_addr.ip().to_string());
         
         // Enable full tunnel if configured
-        #[cfg(target_os = "macos")]
         if self.config.tun_config.full_tunnel {
             self.tunnel.enable_full_tunnel()?;
         }
@@ -174,7 +173,19 @@ impl AivpnClient {
                     Ok(n) => {
                         if n > 0 {
                             debug!("TUN read {} bytes", n);
-                            let _ = tun_to_udp_tx_clone.send(buf[..n].to_vec()).await;
+                            
+                            #[cfg(target_os = "macos")]
+                            let payload = if n > 4 && buf[0] == 0 && buf[1] == 0 {
+                                // Strip 4-byte PI header
+                                &buf[4..n]
+                            } else {
+                                &buf[..n]
+                            };
+                            
+                            #[cfg(not(target_os = "macos"))]
+                            let payload = &buf[..n];
+                            
+                            let _ = tun_to_udp_tx_clone.send(payload.to_vec()).await;
                         }
                     }
                     Err(e) => {
