@@ -574,6 +574,16 @@ impl Gateway {
                 socket.send_to(&packet, client_addr).await?;
             }
             
+            // Complete PFS ratchet immediately after sending ServerHello
+            // so that TUN read loop uses ratcheted keys (matching client side)
+            {
+                let session_id = session.lock().session_id;
+                self.session_manager.complete_session_ratchet(&session_id);
+                // Refresh tag_map so server recognizes client's ratcheted tags
+                self.session_manager.refresh_session_tags(&session_id);
+                info!("PFS ratchet complete for {} (post-ServerHello)", hash_addr(&client_addr));
+            }
+            
             is_new_session = true;
             info!("New session from {} (ServerHello sent)", hash_addr(&client_addr));
             (session, counter, is_ratcheted)
