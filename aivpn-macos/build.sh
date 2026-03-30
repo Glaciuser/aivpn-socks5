@@ -19,6 +19,7 @@ SWIFT_SOURCES=(
     "$SCRIPT_DIR/VPNManager.swift"
     "$SCRIPT_DIR/LocalizationManager.swift"
     "$SCRIPT_DIR/KeychainHelper.swift"
+    "$SCRIPT_DIR/ConnectionKey.swift"
 )
 
 HELPER_SOURCES=(

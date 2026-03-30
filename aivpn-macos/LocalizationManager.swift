@@ -67,6 +67,70 @@ class LocalizationManager: ObservableObject {
             "en": "Starting service...",
             "ru": "Запуск сервиса..."
         ],
+        "key_name": [
+            "en": "Key Name",
+            "ru": "Название ключа"
+        ],
+        "select_key": [
+            "en": "Select Key",
+            "ru": "Выбрать ключ"
+        ],
+        "select_key_prompt": [
+            "en": "Select a connection key",
+            "ru": "Выберите ключ подключения"
+        ],
+        "add_key": [
+            "en": "Add Key",
+            "ru": "Добавить ключ"
+        ],
+        "done": [
+            "en": "Done",
+            "ru": "Готово"
+        ],
+        "edit": [
+            "en": "Edit",
+            "ru": "Изменить"
+        ],
+        "delete": [
+            "en": "Delete",
+            "ru": "Удалить"
+        ],
+        "duplicate_key": [
+            "en": "This key already exists",
+            "ru": "Этот ключ уже существует"
+        ],
+        "delete_key_confirm": [
+            "en": "Delete Key?",
+            "ru": "Удалить ключ?"
+        ],
+        "delete_key_message": [
+            "en": "Are you sure you want to delete this key?",
+            "ru": "Вы уверены что хотите удалить этот ключ?"
+        ],
+        "cancel": [
+            "en": "Cancel",
+            "ru": "Отмена"
+        ],
+        "connection_keys": [
+            "en": "Connection Keys",
+            "ru": "Ключи подключения"
+        ],
+        "no_keys_yet": [
+            "en": "No keys yet",
+            "ru": "Нет ключей"
+        ],
+        "add_first_key": [
+            "en": "Add First Key",
+            "ru": "Добавить первый ключ"
+        ],
+        "no_key_selected": [
+            "en": "No key selected",
+            "ru": "Ключ не выбран"
+        ],
+        "save_key": [
+            "en": "Save",
+            "ru": "Сохранить"
+        ],
     ]
 
     init() {

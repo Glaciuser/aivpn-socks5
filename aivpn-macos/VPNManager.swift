@@ -32,6 +32,12 @@ class VPNManager: ObservableObject {
     @Published var savedKey: String = ""
     @Published var helperAvailable: Bool = false
     @Published var helperVersion: String = ""
+    
+    // Поддержка списка ключей
+    @Published var selectedKeyId: String?
+    var keys: [ConnectionKey] {
+        get { KeychainStorage.shared.keys }
+    }
 
     private var statusPollTimer: Timer?
     private var trafficTimer: Timer?
@@ -43,9 +49,20 @@ class VPNManager: ObservableObject {
     private let defaults = UserDefaults.standard
 
     init() {
-        let raw = defaults.string(forKey: "connection_key") ?? ""
-        savedKey = raw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-            .replacingOccurrences(of: "aivpn://", with: "")
+        // Загрузить ключи из нового хранилища
+        KeychainStorage.shared.loadKeys()
+        selectedKeyId = KeychainStorage.shared.selectedKeyId
+        
+        // Для обратной совместимости: если есть старый ключ и нет новых, добавить его
+        if let raw = defaults.string(forKey: "connection_key"), !raw.isEmpty {
+            let keyValue = raw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                .replacingOccurrences(of: "aivpn://", with: "")
+            if KeychainStorage.shared.keys.isEmpty {
+                KeychainStorage.shared.addKey(name: "Default", keyValue: keyValue)
+                selectedKeyId = KeychainStorage.shared.selectedKeyId
+            }
+            savedKey = keyValue
+        }
 
         // Check helper availability after a short delay
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -57,6 +74,47 @@ class VPNManager: ObservableObject {
 
     private func saveKey(_ key: String) {
         defaults.set(key, forKey: "connection_key")
+    }
+    
+    // MARK: - Key Management
+    
+    /// Выбрать ключ по ID
+    func selectKey(id: String?) {
+        selectedKeyId = id
+        KeychainStorage.shared.selectKey(id: id)
+        
+        if let key = KeychainStorage.shared.selectedKey {
+            savedKey = key.keyValue
+        }
+    }
+    
+    /// Добавить новый ключ
+    func addKey(name: String, keyValue: String) -> Bool {
+        if let newKey = KeychainStorage.shared.addKey(name: name, keyValue: keyValue) {
+            selectedKeyId = newKey.id
+            savedKey = newKey.keyValue
+            return true
+        }
+        return false
+    }
+    
+    /// Удалить ключ
+    func deleteKey(id: String) {
+        KeychainStorage.shared.deleteKey(id: id)
+        if selectedKeyId == id {
+            selectedKeyId = KeychainStorage.shared.selectedKeyId
+            savedKey = KeychainStorage.shared.selectedKey?.keyValue ?? ""
+        }
+    }
+    
+    /// Обновить имя ключа
+    func updateKeyName(id: String, newName: String) {
+        KeychainStorage.shared.updateKeyName(id: id, newName: newName)
+    }
+    
+    /// Получить выбранный ключ
+    var selectedKey: ConnectionKey? {
+        return KeychainStorage.shared.selectedKey
     }
 
     // MARK: - Helper Communication

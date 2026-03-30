@@ -27,6 +27,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem?.button {
             button.image = NSImage(systemSymbolName: "circle", accessibilityDescription: "Disconnected")
             button.action = #selector(togglePopover(_:))
+            button.target = self
         }
 
         // Create popover
@@ -35,7 +36,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .environmentObject(LocalizationManager.shared)
 
         popover = NSPopover()
-        popover?.contentSize = NSSize(width: 340, height: 300)
+        popover?.contentSize = NSSize(width: 360, height: 440)
         popover?.behavior = .transient
         popover?.contentViewController = NSHostingController(rootView: contentView)
 
@@ -48,6 +49,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Check helper daemon on launch
         VPNManager.shared.checkHelperAvailable()
+        
+        // Start polling for connection status changes
+        startStatusPolling()
+    }
+    
+    var statusPollTimer: Timer?
+    
+    func startStatusPolling() {
+        statusPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.checkConnectionStatus()
+        }
+    }
+    
+    func checkConnectionStatus() {
+        let connected = VPNManager.shared.isConnected
+        updateStatusIcon(connected: connected)
     }
 
     @objc func togglePopover(_ sender: Any?) {
@@ -61,15 +78,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func updateStatusIcon(connected: Bool) {
+        guard let button = statusItem?.button else { return }
+        
         DispatchQueue.main.async {
-            if let button = self.statusItem?.button {
-                let iconName = connected ? "circle.fill" : "circle"
-                let color: NSColor = connected ? .systemGreen : .systemGray
-                let image = NSImage(systemSymbolName: iconName, accessibilityDescription: connected ? "Connected" : "Disconnected")
-                image?.isTemplate = true
-                button.image = image
-                button.contentTintColor = color
-            }
+            // Use template image with white color for better visibility
+            let iconName = connected ? "circle.fill" : "circle"
+            
+            // Create image as template so it renders in menu bar style (white)
+            let image = NSImage(systemSymbolName: iconName, accessibilityDescription: connected ? "Connected" : "Disconnected")
+            image?.isTemplate = true  // This makes it render as white in menu bar
+            
+            // Force image update
+            button.image = nil
+            button.image = image
+            
+            // Remove contentTintColor to use system menu bar color (white)
+            button.contentTintColor = nil
+            
+            // Update tooltip
+            button.toolTip = connected ? "AIVPN: Connected" : "AIVPN: Disconnected"
         }
     }
 }
