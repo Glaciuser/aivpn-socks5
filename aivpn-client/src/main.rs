@@ -5,9 +5,10 @@ use aivpn_client::client::ClientConfig;
 use aivpn_client::tunnel::TunnelConfig;
 use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
 use clap::Parser;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use base64::Engine;
 
 /// AIVPN Client - Censorship-resistant VPN client
@@ -136,39 +137,63 @@ async fn main() {
         }
     });
     
-    // Create config
-    let config = ClientConfig {
-        server_addr: server_addr,
-        server_public_key,
-        preshared_key,
-        initial_mask: webrtc_zoom_v3(),
-        server_signing_pub: None,
-        tun_config: TunnelConfig {
-            tun_name: args.tun_name.unwrap_or_else(|| {
-                use rand::Rng;
-                format!("tun{:04x}", rand::thread_rng().gen::<u16>())
-            }),
-            tun_addr: tun_addr,
-            tun_netmask: "255.255.255.0".to_string(),
-            mtu: 1280,
-            full_tunnel: args.full_tunnel,
-        },
-    };
-    
-    // Create and run client
-    match AivpnClient::new(config) {
-        Ok(mut client) => {
-            info!("Client initialized successfully");
-            
-            // Run client in same task (don't spawn)
-            if let Err(e) = client.run().await {
-                error!("Client error: {}", e);
-                std::process::exit(1);
+    let tun_name_fixed = args.tun_name.clone();
+    let full_tunnel = args.full_tunnel;
+    let tun_addr = tun_addr;
+
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(60);
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            info!("Shutdown requested, stopping client loop");
+            break;
+        }
+
+        // Use stable TUN name when user asked for it; otherwise generate fresh.
+        // Fresh name avoids rare conflicts when previous TUN wasn't fully torn down yet.
+        let tun_name = tun_name_fixed.clone().unwrap_or_else(|| {
+            use rand::Rng;
+            format!("tun{:04x}", rand::thread_rng().gen::<u16>())
+        });
+
+        let config = ClientConfig {
+            server_addr: server_addr.clone(),
+            server_public_key,
+            preshared_key,
+            initial_mask: webrtc_zoom_v3(),
+            server_signing_pub: None,
+            tun_config: TunnelConfig {
+                tun_name: tun_name.clone(),
+                tun_addr: tun_addr.clone(),
+                tun_netmask: "255.255.255.0".to_string(),
+                mtu: 1280,
+                full_tunnel,
+            },
+        };
+
+        match AivpnClient::new(config) {
+            Ok(mut client) => {
+                info!("Client initialized successfully (TUN: {})", tun_name);
+
+                match client.run(shutdown.clone()).await {
+                    Ok(()) => break,
+                    Err(e) => {
+                        warn!("Client run failed: {}. Reconnecting in {}s", e, backoff.as_secs());
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to create client: {}. Reconnecting in {}s", e, backoff.as_secs());
             }
         }
-        Err(e) => {
-            error!("Failed to create client: {}", e);
-            std::process::exit(1);
+
+        if shutdown.load(Ordering::SeqCst) {
+            info!("Shutdown requested after failure");
+            break;
         }
+
+        tokio::time::sleep(backoff).await;
+        backoff = std::cmp::min(backoff * 2, max_backoff);
     }
 }

@@ -83,115 +83,132 @@ class AivpnService : VpnService() {
         totalDownloadBytes = 0
 
         serviceJob = serviceScope.launch {
-            try {
-                statusCallback?.invoke(true, getString(R.string.status_connecting))
+            var attempt = 0
+            var backoffMs = 1_000L
+            val maxBackoffMs = 60_000L
 
-                // Parse server address
-                val parts = serverAddr.split(":")
-                val host = parts[0]
-                val port = parts.getOrElse(1) { "443" }.toInt()
+            while (isActive && connectionGeneration == generation && !manualDisconnect) {
+                try {
+                    statusCallback?.invoke(true, getString(R.string.status_connecting))
 
-                // Decode server public key
-                val serverKey = android.util.Base64.decode(
-                    serverKeyBase64, android.util.Base64.DEFAULT
-                )
-                if (serverKey.size != 32) {
-                    statusCallback?.invoke(false, getString(R.string.error_invalid_key))
-                    stopSelf()
-                    return@launch
+                    // Parse server address
+                    val parts = serverAddr.split(":")
+                    val host = parts[0]
+                    val port = parts.getOrElse(1) { "443" }.toInt()
+
+                    // Decode server public key
+                    val serverKey = android.util.Base64.decode(
+                        serverKeyBase64, android.util.Base64.DEFAULT
+                    )
+                    if (serverKey.size != 32) {
+                        statusCallback?.invoke(false, getString(R.string.error_invalid_key))
+                        break
+                    }
+
+                    // Decode PSK if provided
+                    val psk: ByteArray? = pskBase64?.let {
+                        val decoded = android.util.Base64.decode(it, android.util.Base64.DEFAULT)
+                        if (decoded.size == 32) decoded else null
+                    }
+
+                    // Initialize crypto engine (fresh per attempt)
+                    val crypto = AivpnCrypto(serverKey, psk)
+
+                    // Create UDP socket to the AIVPN server
+                    val socket = DatagramSocket()
+                    socket.connect(InetSocketAddress(host, port))
+                    udpSocket = socket
+
+                    // Protect the UDP socket from being routed through our own VPN
+                    protect(socket)
+
+                    // Send init handshake (eph_pub + keepalive)
+                    val initPacket = crypto.buildInitPacket()
+                    socket.send(DatagramPacket(initPacket, initPacket.size))
+
+                    // Wait for ServerHello response
+                    val recvBuf = ByteArray(2048)
+                    val response = DatagramPacket(recvBuf, recvBuf.size)
+                    socket.soTimeout = 5000
+                    socket.receive(response)
+
+                    // Process ServerHello and complete PFS ratchet
+                    val serverHelloData = recvBuf.copyOf(response.length)
+                    if (!crypto.processServerHello(serverHelloData)) {
+                        statusCallback?.invoke(false, getString(R.string.error_handshake))
+                        throw RuntimeException("Handshake failed (ServerHello validation)")
+                    }
+                    socket.soTimeout = 0 // Remove timeout for normal operation
+
+                    // Establish TUN interface via Android's VpnService API
+                    val tunAddress = vpnIp ?: "10.0.0.2"
+                    val builder = Builder()
+                        .setSession("AIVPN")
+                        .addAddress(tunAddress, 24)
+                        .addRoute("0.0.0.0", 0)
+                        .addDnsServer("8.8.8.8")
+                        .addDnsServer("1.1.1.1")
+                        .setMtu(TUN_MTU)
+                        .setBlocking(true)
+
+                    vpnInterface = builder.establish()
+                        ?: throw Exception("Failed to establish VPN interface")
+
+                    isRunning = true
+                    lastStatusText = getString(R.string.status_connected, host)
+                    statusCallback?.invoke(true, lastStatusText)
+                    updateNotification(getString(R.string.notification_connected, host))
+
+                    val tunFd = vpnInterface!!
+                    val tunIn = FileInputStream(tunFd.fileDescriptor)
+                    val tunOut = FileOutputStream(tunFd.fileDescriptor)
+
+                    // Launch three coroutines for bidirectional forwarding/keepalive
+                    val tunToUdp = launch { tunToServer(tunIn, socket, crypto) }
+                    val udpToTun = launch { serverToTun(socket, tunOut, crypto) }
+                    val keepaliveLoop = launch { keepaliveToServer(socket, crypto) }
+
+                    // Wait until either direction fails or is cancelled.
+                    // If we exit "normally" without CancellationException, treat it as a reconnectable failure.
+                    tunToUdp.join()
+                    udpToTun.join()
+                    keepaliveLoop.join()
+                    throw RuntimeException("Tunnel forwarding stopped")
+
+                } catch (e: CancellationException) {
+                    // Normal shutdown / service stop.
+                    break
+                } catch (e: Exception) {
+                    isRunning = false
+                    attempt += 1
+                    lastStatusText = getString(R.string.status_error, e.message ?: "unknown")
+                    statusCallback?.invoke(false, lastStatusText)
+
+                    // Make sure all child loops are stopped before cleanup/retry.
+                    coroutineContext.cancelChildren()
+                    cleanup()
+
+                    if (connectionGeneration != generation || manualDisconnect) {
+                        break
+                    }
+
+                    val delayMs = (backoffMs).coerceAtMost(maxBackoffMs)
+                    backoffMs = (backoffMs * 2).coerceAtMost(maxBackoffMs)
+
+                    statusCallback?.invoke(true, getString(R.string.status_reconnecting))
+                    updateNotification(getString(R.string.notification_connecting))
+                    delay(delayMs)
                 }
+            }
 
-                // Decode PSK if provided
-                val psk: ByteArray? = pskBase64?.let {
-                    val decoded = android.util.Base64.decode(it, android.util.Base64.DEFAULT)
-                    if (decoded.size == 32) decoded else null
-                }
-
-                // Initialize crypto engine
-                val crypto = AivpnCrypto(serverKey, psk)
-
-                // Create UDP socket to the AIVPN server
-                val socket = DatagramSocket()
-                socket.connect(InetSocketAddress(host, port))
-                udpSocket = socket
-
-                // Protect the UDP socket from being routed through our own VPN
-                protect(socket)
-
-                // Send init handshake (eph_pub + keepalive)
-                val initPacket = crypto.buildInitPacket()
-                socket.send(DatagramPacket(initPacket, initPacket.size))
-
-                // Wait for ServerHello response
-                val recvBuf = ByteArray(2048)
-                val response = DatagramPacket(recvBuf, recvBuf.size)
-                socket.soTimeout = 5000
-                socket.receive(response)
-
-                // Process ServerHello and complete PFS ratchet
-                val serverHelloData = recvBuf.copyOf(response.length)
-                if (!crypto.processServerHello(serverHelloData)) {
-                    statusCallback?.invoke(false, getString(R.string.error_handshake))
-                    stopSelf()
-                    return@launch
-                }
-                socket.soTimeout = 0 // Remove timeout for normal operation
-
-                // Establish TUN interface via Android's VpnService API
-                val tunAddress = vpnIp ?: "10.0.0.2"
-                val builder = Builder()
-                    .setSession("AIVPN")
-                    .addAddress(tunAddress, 24)
-                    .addRoute("0.0.0.0", 0)
-                    .addDnsServer("8.8.8.8")
-                    .addDnsServer("1.1.1.1")
-                    .setMtu(TUN_MTU)
-                    .setBlocking(true)
-
-                vpnInterface = builder.establish()
-                    ?: throw Exception("Failed to establish VPN interface")
-
-                isRunning = true
-                lastStatusText = getString(R.string.status_connected, host)
-                statusCallback?.invoke(true, lastStatusText)
-                updateNotification(getString(R.string.notification_connected, host))
-
-                val tunFd = vpnInterface!!
-                val tunIn = FileInputStream(tunFd.fileDescriptor)
-                val tunOut = FileOutputStream(tunFd.fileDescriptor)
-
-                // Launch two coroutines for bidirectional forwarding
-                val tunToUdp = launch {
-                    tunToServer(tunIn, socket, crypto)
-                }
-                val udpToTun = launch {
-                    serverToTun(socket, tunOut, crypto)
-                }
-                val keepaliveLoop = launch {
-                    keepaliveToServer(socket, crypto)
-                }
-
-                // Wait until either direction fails or is cancelled
-                tunToUdp.join()
-                udpToTun.join()
-                keepaliveLoop.join()
-
-            } catch (e: CancellationException) {
-                // Normal shutdown
-            } catch (e: Exception) {
-                isRunning = false
-                lastStatusText = getString(R.string.status_error, e.message ?: "unknown")
-                statusCallback?.invoke(false, lastStatusText)
-            } finally {
-                isRunning = false
-                cleanup()
-                if (serviceJob == coroutineContext[Job]) {
-                    serviceJob = null
-                }
-                if (connectionGeneration == generation && !manualDisconnect) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                }
+            isRunning = false
+            cleanup()
+            if (serviceJob == coroutineContext[Job]) {
+                serviceJob = null
+            }
+            if (connectionGeneration == generation && !manualDisconnect) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
         }
     }

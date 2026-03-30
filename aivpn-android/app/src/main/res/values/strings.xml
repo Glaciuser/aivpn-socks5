@@ -5,6 +5,7 @@
     <string name="status_disconnected">Disconnected</string>
     <string name="status_connecting">Connecting…</string>
     <string name="status_connected">Connected to %s</string>
+    <string name="status_reconnecting">Reconnecting…</string>
     <string name="status_error">Error: %s</string>
     <string name="btn_connect">Connect</string>
     <string name="btn_disconnect">Disconnect</string>

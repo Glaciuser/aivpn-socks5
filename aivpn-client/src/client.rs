@@ -8,6 +8,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -149,31 +151,36 @@ impl AivpnClient {
     }
     
     /// Run the client main loop
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
         self.connect().await?;
-        
+
         // Send initial handshake packet with eph_pub to establish session
         self.send_init().await?;
-        
+
         info!("Starting client main loop");
         info!("Routing traffic through AIVPN tunnel...");
-        
+
         // Create channels for TUN <-> UDP forwarding
         let (tun_to_udp_tx, mut tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(100);
         let (udp_to_tun_tx, mut udp_to_tun_rx) = mpsc::channel::<Vec<u8>>(100);
-        
+
         // Take the TUN reader for the spawned task (no Mutex needed)
         let mut tun_reader = self.tunnel.take_reader()
             .ok_or(Error::Session("TUN reader not available".into()))?;
         let tun_to_udp_tx_clone = tun_to_udp_tx.clone();
-        tokio::spawn(async move {
+        let shutdown_for_tasks = shutdown.clone();
+        let tun_task = tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_PACKET_SIZE];
             loop {
+                if shutdown_for_tasks.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 match tun_reader.read(&mut buf).await {
                     Ok(n) => {
                         if n > 0 {
                             debug!("TUN read {} bytes", n);
-                            
+
                             #[cfg(target_os = "macos")]
                             let payload = if n > 4 && buf[0] == 0 && buf[1] == 0 {
                                 // Strip 4-byte PI header
@@ -181,60 +188,122 @@ impl AivpnClient {
                             } else {
                                 &buf[..n]
                             };
-                            
+
                             #[cfg(not(target_os = "macos"))]
                             let payload = &buf[..n];
-                            
+
                             let _ = tun_to_udp_tx_clone.send(payload.to_vec()).await;
                         }
                     }
                     Err(e) => {
                         error!("TUN read error: {}", e);
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
             }
         });
-        
+
         // Spawn UDP reader task
         let udp_socket = self.udp_socket.as_ref().unwrap().clone();
         let udp_to_tun_tx_clone = udp_to_tun_tx.clone();
-        let session_keys = self.session_keys.clone();
-        tokio::spawn(async move {
+        let shutdown_for_tasks = shutdown.clone();
+        let udp_task = tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_PACKET_SIZE];
+            let mut consecutive_errors: u32 = 0;
+
             loop {
+                if shutdown_for_tasks.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 match udp_socket.recv(&mut buf).await {
                     Ok(n) => {
+                        consecutive_errors = 0;
                         if n > 0 {
                             let _ = udp_to_tun_tx_clone.send(buf[..n].to_vec()).await;
                         }
                     }
                     Err(e) => {
+                        consecutive_errors += 1;
                         error!("UDP recv error: {}", e);
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        if consecutive_errors >= 20 {
+                            // Socket is likely dead; let the main loop handle reconnect.
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
             }
         });
-        
+
         // Main forwarding loop
-        loop {
+        let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut shutdown_tick = tokio::time::interval(Duration::from_secs(1));
+        shutdown_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let run_res: Result<()> = loop {
             tokio::select! {
-                // TUN -> UDP (outbound traffic)
-                Some(packet) = tun_to_udp_rx.recv() => {
-                    if let Err(e) = self.send_packet(&packet).await {
-                        warn!("Send error: {}", e);
+                // Allow fast shutdown.
+                _ = shutdown_tick.tick() => {
+                    if shutdown.load(Ordering::SeqCst) {
+                        info!("Shutdown requested");
+                        break Ok(());
                     }
                 }
-                
-                // UDP -> TUN (inbound traffic)  
-                Some(packet) = udp_to_tun_rx.recv() => {
+
+                // Periodic keepalive so idle connections also detect failures.
+                _ = keepalive_interval.tick() => {
+                    if let Err(e) = self.send_control(&ControlPayload::Keepalive).await {
+                        warn!("Keepalive send error: {}", e);
+                        break Err(e);
+                    }
+                }
+
+                // TUN -> UDP (outbound traffic)
+                res = tun_to_udp_rx.recv() => {
+                    let packet = match res {
+                        Some(p) => p,
+                        None => break Err(Error::Channel("TUN->UDP channel closed".into())),
+                    };
+
+                    // If we can't send, reconnect is required (e.g. network changed).
+                    if let Err(e) = self.send_packet(&packet).await {
+                        warn!("Send error: {}", e);
+                        break Err(e);
+                    }
+                }
+
+                // UDP -> TUN (inbound traffic)
+                res = udp_to_tun_rx.recv() => {
+                    let packet = match res {
+                        Some(p) => p,
+                        None => break Err(Error::Channel("UDP->TUN channel closed".into())),
+                    };
+
                     if let Err(e) = self.receive_and_write_packet(&packet).await {
-                        warn!("Receive error: {}", e);
+                        // Invalid packets are usually transient; do not reconnect on every decoding error.
+                        match &e {
+                            Error::InvalidPacket(_) => warn!("Receive invalid packet: {}", e),
+                            _ => {
+                                warn!("Receive error: {}", e);
+                                break Err(e);
+                            }
+                        }
                     }
                 }
             }
-        }
+        };
+
+        // Stop background tasks before disconnecting.
+        tun_task.abort();
+        udp_task.abort();
+        let _ = tun_task.await;
+        let _ = udp_task.await;
+
+        self.disconnect().await;
+
+        run_res
     }
 
     /// Send packet to server

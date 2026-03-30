@@ -11,27 +11,27 @@ class VPNManager: ObservableObject {
     @Published var bytesReceived: Int64 = 0
     @Published var savedKey: String = ""
 
-    private var clientProcess: Process?
-    private var outputPipe: Pipe?
-    private var errorPipe: Pipe?
-    private var timer: Timer?
+    private var logMonitorTimer: Timer?
+    private var logFileOffset: UInt64 = 0
+    private var trafficTimer: Timer?
+    private var healthCheckTimer: Timer?
     private let keychain = KeychainHelper()
+
+    private var logFilePath: String { "/tmp/aivpn_client.log" }
+    private var pidFilePath: String { "/tmp/aivpn_client.pid" }
 
     init() {
         let raw = keychain.load(key: "connection_key") ?? ""
-        // Normalize: strip aivpn:// prefix if present
-        savedKey = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        savedKey = raw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             .replacingOccurrences(of: "aivpn://", with: "")
     }
 
     func connect(key: String, fullTunnel: Bool = false) {
         guard !isConnecting else { return }
 
-        // Normalize key — strip aivpn:// prefix and whitespace
-        let normalizedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedKey = key.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             .replacingOccurrences(of: "aivpn://", with: "")
 
-        // Save normalized key (base64 only, without prefix)
         savedKey = normalizedKey
         keychain.save(key: "connection_key", value: normalizedKey)
 
@@ -43,96 +43,89 @@ class VPNManager: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
-            // Find aivpn-client binary
             let binaryPath = Bundle.main.bundlePath + "/Contents/Resources/aivpn-client"
-            let fallbackPaths = [
-                "/usr/local/bin/aivpn-client",
-                "/opt/homebrew/bin/aivpn-client",
-            ]
+            let fallbackBinary = "/usr/local/bin/aivpn-client"
+            let finalBinary = FileManager.default.isExecutableFile(atPath: binaryPath) ? binaryPath : fallbackBinary
 
-            var execPath = binaryPath
-            if !FileManager.default.isExecutableFile(atPath: execPath) {
-                for path in fallbackPaths {
-                    if FileManager.default.isExecutableFile(atPath: path) {
-                        execPath = path
-                        break
-                    }
-                }
-            }
-
-            // Build the command to run with sudo
-            var args = [execPath, "-k", key]
-            if fullTunnel {
-                args.append("--full-tunnel")
-            }
-
-            // Use AppleScript to get admin privileges
-            let argString = args.map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }.joined(separator: " ")
-            // We need to run the process in background, so use a wrapper script
-            let wrapperScript = """
-            #!/bin/bash
-            \(argString) &
-            echo $!
-            """
-
-            // Write wrapper to temp file
-            let tmpDir = NSTemporaryDirectory()
-            let wrapperPath = tmpDir + "aivpn_connect.sh"
-            try? wrapperScript.write(toFile: wrapperPath, atomically: true, encoding: .utf8)
-
-            // Make executable
-            let chmodProcess = Process()
-            chmodProcess.executableURL = URL(fileURLWithPath: "/bin/chmod")
-            chmodProcess.arguments = ["+x", wrapperPath]
-            try? chmodProcess.run()
-            chmodProcess.waitUntilExit()
-
-            DispatchQueue.main.async {
-                self.lastError = nil
-            }
-
-            // Run the actual process directly (user will be prompted for password)
-            let process = Process()
-            self.clientProcess = process
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-            process.arguments = args
-
-            let outputPipe = Pipe()
-            let errorPipe = Pipe()
-            self.outputPipe = outputPipe
-            self.errorPipe = errorPipe
-            process.standardOutput = outputPipe
-            process.standardError = errorPipe
-
-            outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                if !data.isEmpty, let str = String(data: data, encoding: .utf8) {
-                    self?.parseOutput(str)
-                }
-            }
-
-            errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                if !data.isEmpty, let str = String(data: data, encoding: .utf8) {
-                    self?.parseOutput(str)
-                }
-            }
-
-            do {
-                try process.run()
-                process.waitUntilExit()
-
+            if !FileManager.default.isExecutableFile(atPath: finalBinary) {
                 DispatchQueue.main.async {
                     self.isConnecting = false
-                    self.isConnected = false
-                    if process.terminationStatus != 0 {
-                        self.lastError = "Exit code: \(process.terminationStatus)"
+                    self.lastError = "aivpn-client not found"
+                }
+                return
+            }
+
+            // Clear old files
+            try? "".write(toFile: self.logFilePath, atomically: true, encoding: .utf8)
+            try? "".write(toFile: self.pidFilePath, atomically: true, encoding: .utf8)
+            self.logFileOffset = 0
+
+            // Write a single launcher script to /tmp that does everything
+            let tunnelArg = fullTunnel ? "--full-tunnel" : ""
+            let launchScript = """
+#!/bin/bash
+# Kill old instance
+if [ -f /tmp/aivpn_client.pid ]; then
+    kill $(cat /tmp/aivpn_client.pid) 2>/dev/null
+    rm -f /tmp/aivpn_client.pid
+fi
+# Start aivpn-client in background
+nohup "\(finalBinary)" -k "\(normalizedKey)" \(tunnelArg) > /tmp/aivpn_client.log 2>&1 &
+echo $! > /tmp/aivpn_client.pid
+exit 0
+"""
+            let launchPath = "/tmp/aivpn_launch.sh"
+            try? launchScript.write(toFile: launchPath, atomically: true, encoding: .utf8)
+
+            // Make executable
+            let chmod = Process()
+            chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+            chmod.arguments = ["+x", launchPath]
+            try? chmod.run()
+            chmod.waitUntilExit()
+
+            // Run with admin privileges via osascript
+            let osascript = Process()
+            osascript.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            osascript.arguments = ["-e", "do shell script \"bash /tmp/aivpn_launch.sh\" with administrator privileges"]
+
+            let errPipe = Pipe()
+            osascript.standardError = errPipe
+
+            do {
+                try osascript.run()
+                osascript.waitUntilExit()
+
+                if osascript.terminationStatus != 0 {
+                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errMsg = String(data: errData, encoding: .utf8) ?? ""
+                    DispatchQueue.main.async {
+                        self.isConnecting = false
+                        self.lastError = errMsg.isEmpty ? "Authorization failed" : errMsg
+                    }
+                    return
+                }
+
+                // Wait for PID
+                sleep(2)
+                let pidStr = try? String(contentsOfFile: self.pidFilePath, encoding: .utf8)
+                let trimmed = (pidStr ?? "").trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+
+                if !trimmed.isEmpty, Int32(trimmed) != nil {
+                    DispatchQueue.main.async {
+                        self.startLogMonitor()
+                        self.startHealthCheck()
+                    }
+                } else {
+                    let log = (try? String(contentsOfFile: self.logFilePath, encoding: .utf8)) ?? ""
+                    DispatchQueue.main.async {
+                        self.isConnecting = false
+                        self.lastError = log.isEmpty ? "Failed to start" : String(log.prefix(300))
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.isConnecting = false
-                    self.isConnected = false
                     self.lastError = error.localizedDescription
                 }
             }
@@ -140,27 +133,97 @@ class VPNManager: ObservableObject {
     }
 
     func disconnect() {
-        // Kill the aivpn-client process
-        if let process = clientProcess {
-            process.terminate()
-            // Also try to kill via sudo kill
-            let killProcess = Process()
-            killProcess.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-            killProcess.arguments = ["killall", "aivpn-client"]
-            try? killProcess.run()
-            killProcess.waitUntilExit()
+        let pidStr = try? String(contentsOfFile: pidFilePath, encoding: .utf8)
+        let trimmed = (pidStr ?? "").trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        if !trimmed.isEmpty, let pid = Int32(trimmed) {
+            kill(pid, SIGTERM)
         }
-        clientProcess = nil
-        outputPipe?.fileHandleForReading.readabilityHandler = nil
-        errorPipe?.fileHandleForReading.readabilityHandler = nil
-        timer?.invalidate()
-        timer = nil
+        let killall = Process()
+        killall.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+        killall.arguments = ["aivpn-client"]
+        try? killall.run()
+        killall.waitUntilExit()
+
+        try? FileManager.default.removeItem(atPath: pidFilePath)
+
+        stopLogMonitor()
+        stopHealthCheck()
+        trafficTimer?.invalidate()
+        trafficTimer = nil
 
         DispatchQueue.main.async {
             self.isConnecting = false
             self.isConnected = false
         }
     }
+
+    // MARK: - Log Monitoring
+
+    private func startLogMonitor() {
+        logMonitorTimer?.invalidate()
+        logMonitorTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.readLogFile()
+        }
+    }
+
+    private func stopLogMonitor() {
+        logMonitorTimer?.invalidate()
+        logMonitorTimer = nil
+    }
+
+    private func readLogFile() {
+        guard let fileHandle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: logFilePath)) else { return }
+        defer { try? fileHandle.close() }
+
+        if logFileOffset > 0 {
+            try? fileHandle.seek(toOffset: logFileOffset)
+        }
+
+        let data = fileHandle.readDataToEndOfFile()
+        if data.isEmpty { return }
+
+        logFileOffset += UInt64(data.count)
+
+        if let str = String(data: data, encoding: .utf8) {
+            parseOutput(str)
+        }
+    }
+
+    // MARK: - Process Health Check
+
+    private func startHealthCheck() {
+        healthCheckTimer?.invalidate()
+        healthCheckTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            self?.checkProcessHealth()
+        }
+    }
+
+    private func stopHealthCheck() {
+        healthCheckTimer?.invalidate()
+        healthCheckTimer = nil
+    }
+
+    private func checkProcessHealth() {
+        guard isConnected || isConnecting else { return }
+
+        let pidStr = try? String(contentsOfFile: pidFilePath, encoding: .utf8)
+        let trimmed = (pidStr ?? "").trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let pid = Int32(trimmed) else { return }
+
+        if kill(pid, 0) != 0 {
+            let logContent = (try? String(contentsOfFile: logFilePath, encoding: .utf8)) ?? ""
+            DispatchQueue.main.async {
+                self.isConnecting = false
+                self.isConnected = false
+                let lines = logContent.components(separatedBy: "\n").filter { !$0.isEmpty }
+                self.lastError = lines.last ?? "Process exited unexpectedly"
+            }
+            stopLogMonitor()
+            stopHealthCheck()
+        }
+    }
+
+    // MARK: - Output Parsing
 
     private func parseOutput(_ output: String) {
         let lines = output.components(separatedBy: "\n")
@@ -170,6 +233,7 @@ class VPNManager: ObservableObject {
                 DispatchQueue.main.async {
                     self.isConnecting = false
                     self.isConnected = true
+                    self.lastError = nil
                     self.startTrafficMonitor()
                 }
             }
@@ -182,7 +246,7 @@ class VPNManager: ObservableObject {
 
             if line.contains("ERROR") || line.contains("error") || line.contains("Failed") {
                 DispatchQueue.main.async {
-                    self.lastError = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.lastError = line.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
                 }
             }
 
@@ -201,9 +265,11 @@ class VPNManager: ObservableObject {
         }
     }
 
+    // MARK: - Traffic Monitor
+
     private func startTrafficMonitor() {
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        trafficTimer?.invalidate()
+        trafficTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.bytesSent += Int64.random(in: 100...500)
             self?.bytesReceived += Int64.random(in: 1000...5000)
         }

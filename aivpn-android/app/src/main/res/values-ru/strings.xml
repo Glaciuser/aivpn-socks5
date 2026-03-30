@@ -5,6 +5,7 @@
     <string name="status_disconnected">Отключено</string>
     <string name="status_connecting">Подключение…</string>
     <string name="status_connected">Подключено к %s</string>
+    <string name="status_reconnecting">Повторное подключение…</string>
     <string name="status_error">Ошибка: %s</string>
     <string name="btn_connect">Подключить</string>
     <string name="btn_disconnect">Отключить</string>

@@ -70,6 +70,12 @@ else
     echo "  Run 'cargo build --release --bin aivpn-client' first"
 fi
 
+# Copy helper script into Resources
+echo "📦 Bundling helper script..."
+cp "$SCRIPT_DIR/aivpn_helper.sh" "$RESOURCES/aivpn_helper.sh"
+chmod +x "$RESOURCES/aivpn_helper.sh"
+echo "  ✅ aivpn_helper.sh bundled"
+
 # Copy Info.plist
 cp "$SCRIPT_DIR/Info.plist" "$CONTENTS/Info.plist"
 
@@ -159,6 +165,12 @@ cat > "$RESOURCES/Assets.xcassets/Contents.json" << 'EOF'
   }
 }
 EOF
+
+# Clean extended attributes and ad-hoc sign (required for macOS Sequoia)
+echo "🔐 Signing app..."
+xattr -cr "$APP_BUNDLE" 2>/dev/null
+codesign --force --deep --sign - "$APP_BUNDLE" 2>/dev/null
+echo "  ✅ Signed ($(du -sh "$APP_BUNDLE" | cut -f1))"
 
 echo ""
 echo "✅ Build complete: $APP_BUNDLE"
