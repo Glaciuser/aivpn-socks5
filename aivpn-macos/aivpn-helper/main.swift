@@ -290,6 +290,61 @@ func getLog() -> HelperResponse {
                           log: recent)
 }
 
+/// Get traffic statistics
+func getTrafficStats() -> HelperResponse {
+    // Try to read stats file first
+    let statsPath = "/var/run/aivpn/traffic.stats"
+    if let statsContent = try? String(contentsOfFile: statsPath, encoding: .utf8) {
+        // Format: "sent:X,received:Y"
+        let trimmed = statsContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("sent:") && trimmed.contains("received:") {
+            return HelperResponse(status: "ok", message: trimmed)
+        }
+    }
+    
+    // Fallback: parse last 100 lines of log
+    guard let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) else {
+        return HelperResponse(status: "ok", message: "sent:0,received:0")
+    }
+    
+    let lines = logContent.components(separatedBy: "\n")
+    let recentLines = lines.suffix(100)
+    
+    var totalSent: Int64 = 0
+    var totalReceived: Int64 = 0
+    
+    for line in recentLines {
+        if line.contains("Sent") {
+            let parts = line.components(separatedBy: " ")
+            for (i, part) in parts.enumerated() {
+                if part == "Sent" && i + 1 < parts.count {
+                    if let bytes = Int64(parts[i + 1]) {
+                        totalSent += bytes
+                    }
+                }
+            }
+        }
+        if line.contains("received") || line.contains("Read") {
+            let parts = line.components(separatedBy: " ")
+            for (i, part) in parts.enumerated() {
+                if (part == "received" || part == "Read") && i + 1 < parts.count {
+                    if let bytes = Int64(parts[i + 1]) {
+                        totalReceived += bytes
+                    }
+                }
+            }
+        }
+    }
+    
+    // Trim log file if too large
+    if lines.count > 500 {
+        let trimmed = lines.suffix(500).joined(separator: "\n")
+        try? trimmed.write(toFile: LOG_PATH, atomically: true, encoding: .utf8)
+    }
+    
+    return HelperResponse(status: "ok", message: "sent:\(totalSent),received:\(totalReceived)")
+}
+
 // MARK: - Socket Helpers
 
 /// Build a raw sockaddr_un buffer for the given path
@@ -398,6 +453,9 @@ func handleConnection(_ clientFD: Int32) {
 
     case "log":
         response = getLog()
+
+    case "traffic":
+        response = getTrafficStats()
 
     default:
         response = HelperResponse(status: "error",

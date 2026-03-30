@@ -64,6 +64,9 @@ pub struct AivpnClient {
     send_seq: u32,
     recv_seq: u32,
     recv_counter: u64,
+    // Traffic counters
+    bytes_sent: Arc<std::sync::atomic::AtomicU64>,
+    bytes_received: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AivpnClient {
@@ -71,7 +74,9 @@ impl AivpnClient {
     pub fn new(config: ClientConfig) -> Result<Self> {
         let keypair = KeyPair::generate();
         let tunnel = Tunnel::new(config.tun_config.clone());
-        
+        let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let bytes_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         Ok(Self {
             config,
             state: ClientState::Provisioned,
@@ -84,6 +89,8 @@ impl AivpnClient {
             send_seq: 0,
             recv_seq: 0,
             recv_counter: 0,
+            bytes_sent: bytes_sent.clone(),
+            bytes_received: bytes_received.clone(),
         })
     }
     
@@ -236,6 +243,32 @@ impl AivpnClient {
             }
         });
 
+        // Spawn stats writer task
+        let stats_shutdown = shutdown.clone();
+        let stats_bytes_sent = self.bytes_sent.clone();
+        let stats_bytes_received = self.bytes_received.clone();
+        let stats_task = tokio::spawn(async move {
+            // Write initial stats to both locations
+            let stats = "sent:0,received:0";
+            let _ = std::fs::write("/var/run/aivpn/traffic.stats", stats);
+            let _ = std::fs::write("/tmp/aivpn-traffic.stats", stats);
+            info!("Initial stats written");
+            
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let sent = stats_bytes_sent.load(std::sync::atomic::Ordering::Relaxed);
+                let received = stats_bytes_received.load(std::sync::atomic::Ordering::Relaxed);
+                let stats = format!("sent:{},received:{}", sent, received);
+                let _ = std::fs::write("/var/run/aivpn/traffic.stats", &stats);
+                let _ = std::fs::write("/tmp/aivpn-traffic.stats", &stats);
+                
+                if stats_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+        });
+
         // Main forwarding loop
         let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
         keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -248,6 +281,7 @@ impl AivpnClient {
                 _ = shutdown_tick.tick() => {
                     if shutdown.load(Ordering::SeqCst) {
                         info!("Shutdown requested");
+                        stats_task.abort();
                         break Ok(());
                     }
                 }
@@ -347,10 +381,13 @@ impl AivpnClient {
         
         let socket = self.udp_socket.as_ref().unwrap();
         socket.send(&aivpn_packet).await?;
-        
+
         // Update FSM
         mimicry.update_fsm();
-        
+
+        // Update traffic counter
+        self.bytes_sent.fetch_add(packet.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
         debug!("Sent {} bytes ({} payload)", aivpn_packet.len(), packet.len());
         Ok(())
     }
@@ -433,6 +470,8 @@ impl AivpnClient {
                     return Err(Error::InvalidPacket("Invalid IP version in payload"));
                 }
                 self.tunnel.write_packet_async(ip_payload).await?;
+                // Update traffic counter
+                self.bytes_received.fetch_add(ip_payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 debug!("Received {} bytes from server, wrote to TUN", ip_payload.len());
             }
             InnerType::Control => {
@@ -597,6 +636,15 @@ impl AivpnClient {
     /// Check if connected
     pub fn is_connected(&self) -> bool {
         self.state == ClientState::Connected
+    }
+
+    /// Get traffic statistics
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn bytes_received(&self) -> u64 {
+        self.bytes_received.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

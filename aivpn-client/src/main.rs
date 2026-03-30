@@ -176,6 +176,10 @@ async fn main() {
         match AivpnClient::new(config) {
             Ok(mut client) => {
                 info!("Client initialized successfully (TUN: {})", tun_name);
+                
+                // Write initial stats file
+                let _ = std::fs::write("/var/run/aivpn/traffic.stats", "sent:0,received:0");
+                let _ = std::fs::write("/tmp/aivpn-traffic.stats", "sent:0,received:0");
 
                 match client.run(shutdown.clone()).await {
                     Ok(()) => break,

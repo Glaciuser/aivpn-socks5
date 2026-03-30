@@ -359,8 +359,39 @@ class VPNManager: ObservableObject {
     private func startTrafficMonitor() {
         trafficTimer?.invalidate()
         trafficTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.bytesSent += Int64.random(in: 100...500)
-            self?.bytesReceived += Int64.random(in: 1000...5000)
+            self?.updateTrafficStats()
+        }
+    }
+    
+    /// Update traffic statistics from helper logs
+    private func updateTrafficStats() {
+        // Get log from helper and parse traffic stats
+        sendToHelper(HelperRequest(action: "traffic", key: nil, fullTunnel: nil, binaryPath: nil),
+                     timeoutSeconds: 1.0) { [weak self] response in
+            guard let self = self,
+                  let response = response,
+                  response.status == "ok" else {
+                return
+            }
+            
+            // Response message contains "sent:X,received:Y"
+            let parts = response.message.components(separatedBy: ",")
+            for part in parts {
+                let kv = part.components(separatedBy: ":")
+                if kv.count == 2 {
+                    if let value = Int64(kv[1]) {
+                        if kv[0] == "sent" {
+                            DispatchQueue.main.async {
+                                self.bytesSent = value
+                            }
+                        } else if kv[0] == "received" {
+                            DispatchQueue.main.async {
+                                self.bytesReceived = value
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
