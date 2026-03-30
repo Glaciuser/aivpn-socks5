@@ -71,9 +71,15 @@ if [ -f /tmp/aivpn_client.pid ]; then
 fi
 # Clear old log
 > /tmp/aivpn_client.log
-# Start aivpn-client in background using setsid to properly detach
-setsid "\(finalBinary)" -k "\(normalizedKey)" \(tunnelArg) > /tmp/aivpn_client.log 2>&1 &
-echo $! > /tmp/aivpn_client.pid
+# Start aivpn-client in background
+# Use 'open' command for proper GUI app integration on macOS
+# or direct background execution with nohup workaround
+(
+    cd /
+    "/\(finalBinary)" -k "\(normalizedKey)" \(tunnelArg) > /tmp/aivpn_client.log 2>&1 &
+    echo $! > /tmp/aivpn_client.pid
+)
+disown
 exit 0
 """
             let launchPath = "/tmp/aivpn_launch.sh"
