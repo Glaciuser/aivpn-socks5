@@ -9,11 +9,11 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.selects.select
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -85,12 +85,8 @@ class AivpnService : VpnService() {
     // Whether the current session made it past handshake
     @Volatile private var sessionEstablished = false
 
-    // Network change detection: signals active tunnel to tear down and reconnect
-    private val networkChangeChannel = Channel<Unit>(Channel.CONFLATED)
+    // Network change detection: closing UDP socket signals active tunnel to reconnect
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var networkDebounceJob: Job? = null
-    // Skip the immediate onAvailable() fired right after registerDefaultNetworkCallback()
-    @Volatile private var networkCallbackJustRegistered = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -146,13 +142,6 @@ class AivpnService : VpnService() {
                 while (isActive && !manualDisconnect) {
                     try {
                         sessionEstablished = false
-                        // FIX: cancel any debounce job from the PREVIOUS session and drain
-                        // stale network-change signals before starting a new tunnel.
-                        // Without this, a 2-second-old debounce fires into the new session
-                        // and immediately tears it down.
-                        networkDebounceJob?.cancel()
-                        networkDebounceJob = null
-                        while (networkChangeChannel.tryReceive().isSuccess) {}
                         runTunnel()
                     } catch (e: CancellationException) {
                         throw e
@@ -259,33 +248,22 @@ class AivpnService : VpnService() {
         lastReceiveTime = System.currentTimeMillis()
 
         val tunAddress4 = savedVpnIp ?: "10.0.0.2"
-        val tunAddress6 = savedVpnIp6 ?: "fd00::2"
-        Log.d(TAG, "Establishing TUN interface: IPv4=$tunAddress4 IPv6=$tunAddress6")
+        Log.d(TAG, "Establishing TUN interface: IPv4=$tunAddress4")
         val builder = Builder()
             .setSession("AIVPN")
-            // IPv4
+            // IPv4 only — server does not yet support IPv6 tunnelling;
+            // addRoute("::", 0) causes Android to prefer IPv6, route all its traffic
+            // into the tunnel where packets are dropped → continuous IPv4/IPv6 oscillation.
             .addAddress(tunAddress4, 24)
             .addRoute("0.0.0.0", 0)
-            // IPv6 — dual-stack; prevents IPv6 traffic leaking outside the tunnel
-            .addAddress(tunAddress6, 64)
-            .addRoute("::", 0)
-            // DNS — both stacks
             .addDnsServer("8.8.8.8")
             .addDnsServer("1.1.1.1")
-            .addDnsServer("2001:4860:4860::8888")
-            .addDnsServer("2606:4700:4700::1111")
             .setMtu(TUN_MTU)
             .setBlocking(true)
 
         vpnInterface = builder.establish() ?: throw Exception("Failed to establish VPN interface")
         // Bind VPN to the physical network so traffic routes correctly after network switches
         setUnderlyingNetworks(arrayOf(network))
-        // Cancel any debounce job triggered by onAvailable() during TUN re-establishment,
-        // and drain the channel in case it already fired — prevents immediate reconnect
-        // right after a successful TUN setup.
-        networkDebounceJob?.cancel()
-        networkDebounceJob = null
-        while (networkChangeChannel.tryReceive().isSuccess) {}
         Log.d(TAG, "TUN interface established")
 
         val localTunIn = FileInputStream(vpnInterface!!.fileDescriptor)
@@ -299,25 +277,16 @@ class AivpnService : VpnService() {
         updateNotification(getString(R.string.notification_connected, host))
 
         coroutineScope {
-            // Safety drain — catches signals that arrived between TUN establish() and loop start.
-            // Primary drain+cancel happens right after establish() above.
-            while (networkChangeChannel.tryReceive().isSuccess) {}
-
             val tunToUdp = launch { tunToServer(localTunIn, socket, crypto) }
             val udpToTun = launch { serverToTun(socket, localTunOut, crypto) }
             val keepaliveLoop = launch { keepaliveToServer(socket, crypto) }
             val rekeyLoop = launch { rekeyTimer() }
-            val netWatcher = launch {
-                networkChangeChannel.receive()
-                Log.d(TAG, "Network change detected, tearing down tunnel")
-            }
 
             select<Unit> {
                 tunToUdp.onJoin { }
                 udpToTun.onJoin { }
                 keepaliveLoop.onJoin { }
                 rekeyLoop.onJoin { }
-                netWatcher.onJoin { }
             }
 
             // 1. Cancel children so isActive becomes false in all child coroutines.
@@ -425,36 +394,41 @@ class AivpnService : VpnService() {
         Log.d(TAG, "Rekey interval elapsed — initiating fresh handshake")
     }
 
-    /** Debounced signal: waits 2 s for the network to stabilise before tearing down the tunnel. */
-    private fun signalNetworkChange(reason: String) {
-        networkDebounceJob?.cancel()
-        networkDebounceJob = serviceScope.launch {
-            Log.d(TAG, "$reason — debouncing 2 s before tunnel restart")
-            delay(2_000L)
-            networkChangeChannel.trySend(Unit)
-        }
-    }
-
     private fun registerNetworkCallback() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        networkCallbackJustRegistered = true
+
+        // Use registerNetworkCallback with NET_CAPABILITY_NOT_VPN instead of
+        // registerDefaultNetworkCallback.
+        //
+        // registerDefaultNetworkCallback fires onLost(physical) every time VPN establish()
+        // takes over as the default route, and onAvailable(physical) every time VPN closes —
+        // causing spurious reconnects even when the physical network is perfectly alive.
+        //
+        // With NOT_VPN the system filters out VPN networks entirely: onAvailable/onLost
+        // are delivered only for real physical networks (WiFi, LTE, etc.), so:
+        //   • VPN establish()  → no callback  ✅
+        //   • VPN teardown    → no callback  ✅
+        //   • WiFi → LTE      → onLost(wifi) + onAvailable(lte)  ✅
+        //   • Physical gone   → onLost(physical)  ✅
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (networkCallbackJustRegistered) {
-                    // Android fires onAvailable() immediately for the current network on
-                    // registration — this is NOT a network change, ignore it.
-                    networkCallbackJustRegistered = false
-                    return
-                }
-                if (!isVpnNetwork(network)) signalNetworkChange("New network available")
+                // Close socket directly — IOException in the I/O loops is the reconnect signal.
+                // At registration time udpSocket is null, so this is a safe no-op.
+                Log.d(TAG, "Physical network changed: $network — closing socket")
+                udpSocket?.close()
             }
             override fun onLost(network: Network) {
-                networkCallbackJustRegistered = false
-                if (!isVpnNetwork(network)) signalNetworkChange("Network lost")
+                Log.d(TAG, "Physical network lost: $network — closing socket")
+                udpSocket?.close()
             }
         }
         try {
-            cm.registerDefaultNetworkCallback(callback)
+            cm.registerNetworkCallback(request, callback)
             networkCallback = callback
         } catch (e: Exception) {
             Log.e(TAG, "Failed to register NetworkCallback: ${e.message}", e)
@@ -544,6 +518,7 @@ class AivpnService : VpnService() {
         serviceJob = null
         closeTunnel()
         isRunning = false
+        serviceScope.cancel()          // release the SupervisorJob and all children
         super.onDestroy()
     }
 
