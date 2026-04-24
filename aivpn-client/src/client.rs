@@ -335,6 +335,7 @@ impl AivpnClient {
         let udp_socket = self.udp_socket.as_ref().unwrap().clone();
         let udp_to_tun_tx_clone = udp_to_tun_tx.clone();
         let shutdown_for_tasks = shutdown.clone();
+        let local_socks_runtime_for_udp = self.config.local_socks5_runtime.clone();
         let last_server_packet_at = Arc::new(AtomicU64::new(crypto::current_timestamp_ms()));
         let last_server_packet_at_udp = last_server_packet_at.clone();
         let udp_task = tokio::spawn(async move {
@@ -352,6 +353,9 @@ impl AivpnClient {
                         if n > 0 {
                             last_server_packet_at_udp
                                 .store(crypto::current_timestamp_ms(), Ordering::Relaxed);
+                            if let Some(runtime) = &local_socks_runtime_for_udp {
+                                runtime.observe_server_packet();
+                            }
                             let _ = udp_to_tun_tx_clone.send(Bytes::copy_from_slice(&buf[..n])).await;
                         }
                     }

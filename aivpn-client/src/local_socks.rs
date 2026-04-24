@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, sleep, sleep_until, timeout};
 use tracing::{debug, info, warn};
 
+use aivpn_common::crypto;
 use aivpn_common::error::{Error, Result};
 use crate::netns::NetworkNamespace;
 
@@ -32,18 +34,25 @@ const SOCKS5_REPLY_HOST_UNREACHABLE: u8 = 0x04;
 const SOCKS5_REPLY_CONNECTION_REFUSED: u8 = 0x05;
 const SOCKS5_REPLY_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
-const DEFAULT_LOCAL_SOCKS5_MAX_CLIENTS: usize = 256;
-const DEFAULT_LOCAL_SOCKS5_MAX_CONCURRENT_DIALS: usize = 128;
+const DEFAULT_LOCAL_SOCKS5_MAX_CLIENTS: usize = 1024;
+const DEFAULT_LOCAL_SOCKS5_MAX_CONCURRENT_DIALS: usize = 512;
 const LOCAL_SOCKS5_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_SOCKS5_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCAL_SOCKS5_QUEUE_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 const LOCAL_SOCKS5_SLOW_CONNECT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
-const LOCAL_SOCKS5_UDP_ASSOCIATE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-const LOCAL_SOCKS5_TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const LOCAL_SOCKS5_CLIENT_SLOT_QUEUE_LOG_THRESHOLD: Duration = Duration::from_millis(250);
+const LOCAL_SOCKS5_UDP_ASSOCIATE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+const LOCAL_SOCKS5_TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 const LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD: u32 = 8;
 const LOCAL_SOCKS5_FORCE_RECONNECT_WINDOW: Duration = Duration::from_secs(10);
 const LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD: u32 = 4;
 const LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW: Duration = Duration::from_secs(20);
+const LOCAL_SOCKS5_TIMEOUT_RECONNECT_SERVER_ACTIVITY_GRACE: Duration = Duration::from_secs(15);
+const LOCAL_SOCKS5_DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+const LOCAL_SOCKS5_DNS_CACHE_STALE_GRACE: Duration = Duration::from_secs(300);
+const LOCAL_SOCKS5_DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_SOCKS5_TCP_RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(180);
+const LOCAL_SOCKS5_ENABLE_AUTO_RECONNECT: bool = false;
 const LOCAL_SOCKS5_UNAVAILABLE_LOG_THROTTLE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -130,7 +139,17 @@ pub struct LocalSocks5Runtime {
     reset_notify: Notify,
     reconnect_generation: portable_atomic::AtomicU64,
     reconnect_notify: Notify,
+    last_server_packet_at_ms: portable_atomic::AtomicU64,
+    dns_cache: Mutex<HashMap<String, CachedDnsEntry>>,
     diagnostics: Mutex<LocalSocks5Diagnostics>,
+}
+
+#[derive(Debug)]
+struct CachedDnsEntry {
+    ips: Vec<IpAddr>,
+    expires_at: Instant,
+    stale_expires_at: Instant,
+    next_ip_index: usize,
 }
 
 #[derive(Debug, Default)]
@@ -169,6 +188,8 @@ impl LocalSocks5Runtime {
             reset_notify: Notify::new(),
             reconnect_generation: portable_atomic::AtomicU64::new(1),
             reconnect_notify: Notify::new(),
+            last_server_packet_at_ms: portable_atomic::AtomicU64::new(0),
+            dns_cache: Mutex::new(HashMap::new()),
             diagnostics: Mutex::new(LocalSocks5Diagnostics::default()),
         }
     }
@@ -244,6 +265,69 @@ impl LocalSocks5Runtime {
         self.reconnect_notify.notify_waiters();
     }
 
+    pub fn observe_server_packet(&self) {
+        self.last_server_packet_at_ms
+            .store(crypto::current_timestamp_ms(), Ordering::Relaxed);
+    }
+
+    fn recent_server_packet_age(&self) -> Option<Duration> {
+        let last_server_packet_at_ms = self.last_server_packet_at_ms.load(Ordering::Relaxed);
+        if last_server_packet_at_ms == 0 {
+            return None;
+        }
+
+        Some(Duration::from_millis(
+            crypto::current_timestamp_ms().saturating_sub(last_server_packet_at_ms),
+        ))
+    }
+
+    fn cached_target_addr(&self, host: &str, port: u16, allow_stale: bool) -> Option<SocketAddr> {
+        let now = Instant::now();
+        let cache_key = normalize_dns_cache_key(host);
+        let mut cache = self.dns_cache.lock().ok()?;
+        let entry = cache.get_mut(&cache_key)?;
+        let valid_until = if allow_stale {
+            entry.stale_expires_at
+        } else {
+            entry.expires_at
+        };
+        if now > valid_until || entry.ips.is_empty() {
+            return None;
+        }
+
+        let ip = entry.ips[entry.next_ip_index % entry.ips.len()];
+        entry.next_ip_index = (entry.next_ip_index + 1) % entry.ips.len();
+        Some(SocketAddr::new(ip, port))
+    }
+
+    fn cache_target_addrs<I>(&self, host: &str, addrs: I)
+    where
+        I: IntoIterator<Item = SocketAddr>,
+    {
+        let now = Instant::now();
+        let mut ips = Vec::new();
+        for addr in addrs {
+            if !ips.contains(&addr.ip()) {
+                ips.push(addr.ip());
+            }
+        }
+        if ips.is_empty() {
+            return;
+        }
+
+        if let Ok(mut cache) = self.dns_cache.lock() {
+            cache.insert(
+                normalize_dns_cache_key(host),
+                CachedDnsEntry {
+                    ips,
+                    expires_at: now + LOCAL_SOCKS5_DNS_CACHE_TTL,
+                    stale_expires_at: now + LOCAL_SOCKS5_DNS_CACHE_STALE_GRACE,
+                    next_ip_index: 0,
+                },
+            );
+        }
+    }
+
     pub fn clear_connectivity_failure_streak(&self) {
         if let Ok(mut diagnostics) = self.diagnostics.lock() {
             diagnostics.ready_network_unreachable_streak = 0;
@@ -297,7 +381,9 @@ impl LocalSocks5Runtime {
                 {
                     streak_to_log = Some(streak);
                 }
-                if streak == LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD {
+                if LOCAL_SOCKS5_ENABLE_AUTO_RECONNECT
+                    && streak == LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD
+                {
                     reconnect_reason = Some(format!(
                         "Local SOCKS5 saw {} ready-state network unreachable replies within {:?}; latest target {} from {}: {}",
                         LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD,
@@ -327,7 +413,9 @@ impl LocalSocks5Runtime {
                 peer_addr,
                 streak,
                 LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD,
-                if streak == LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD {
+                if streak == LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD
+                    && reconnect_reason.is_some()
+                {
                     "; requesting client reconnect"
                 } else {
                     ""
@@ -352,8 +440,13 @@ impl LocalSocks5Runtime {
         }
 
         let now = Instant::now();
+        let recent_server_packet_age = self.recent_server_packet_age();
+        let recent_server_activity = recent_server_packet_age.is_some_and(|age| {
+            age <= LOCAL_SOCKS5_TIMEOUT_RECONNECT_SERVER_ACTIVITY_GRACE
+        });
         let mut streak_to_log = None;
         let mut reconnect_reason = None;
+        let mut suppressed_due_to_server_activity = None;
 
         if let Ok(mut diagnostics) = self.diagnostics.lock() {
             let reset_window = match diagnostics.ready_timeout_window_started_at {
@@ -375,15 +468,24 @@ impl LocalSocks5Runtime {
             {
                 streak_to_log = Some(streak);
             }
-            if streak == LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
-                reconnect_reason = Some(format!(
-                    "Local SOCKS5 saw {} ready-state connect timeouts within {:?}; latest target {} from {}: {}",
-                    LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD,
-                    LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW,
-                    target_display,
-                    peer_addr,
-                    detail
-                ));
+            if LOCAL_SOCKS5_ENABLE_AUTO_RECONNECT
+                && streak >= LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD
+            {
+                if recent_server_activity {
+                    if streak == LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
+                        suppressed_due_to_server_activity = recent_server_packet_age;
+                    }
+                } else {
+                    reconnect_reason = Some(format!(
+                        "Local SOCKS5 saw {} ready-state connect timeouts within {:?} without inbound server traffic for at least {:?}; latest target {} from {}: {}",
+                        streak,
+                        LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW,
+                        recent_server_packet_age.unwrap_or(LOCAL_SOCKS5_TIMEOUT_RECONNECT_SERVER_ACTIVITY_GRACE),
+                        target_display,
+                        peer_addr,
+                        detail
+                    ));
+                }
             }
         }
 
@@ -394,11 +496,25 @@ impl LocalSocks5Runtime {
                 peer_addr,
                 streak,
                 LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD,
-                if streak == LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
+                if streak == LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD
+                    && reconnect_reason.is_some()
+                {
                     "; requesting client reconnect"
                 } else {
                     ""
                 },
+                detail
+            );
+        }
+
+        if let Some(server_packet_age) = suppressed_due_to_server_activity {
+            warn!(
+                "Local SOCKS5 kept the dataplane up after {} ready-state connect timeouts within {:?} because inbound server traffic arrived {:?} ago; latest target {} from {}: {}",
+                LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD,
+                LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW,
+                server_packet_age,
+                target_display,
+                peer_addr,
                 detail
             );
         }
@@ -491,15 +607,27 @@ pub async fn spawn_local_socks5_server(
                 }
             };
 
-            let Ok(permit) = client_slots.clone().try_acquire_owned() else {
-                warn!(
-                    "Local SOCKS5 is at capacity on {} ({} active clients); dropping {}",
+            let permit_wait_started = Instant::now();
+            let permit = match client_slots.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    warn!(
+                        "Local SOCKS5 client slot queue is shutting down on {}; dropping {}",
+                        actual_addr,
+                        peer_addr
+                    );
+                    drop(stream);
+                    break;
+                }
+            };
+            let permit_wait = permit_wait_started.elapsed();
+            if permit_wait >= LOCAL_SOCKS5_CLIENT_SLOT_QUEUE_LOG_THRESHOLD {
+                info!(
+                    "Local SOCKS5 waited {:?} for a client slot on {} before serving {}",
+                    permit_wait,
                     actual_addr,
-                    max_clients,
                     peer_addr
                 );
-                drop(stream);
-                continue;
             };
 
             let runtime = runtime.clone();
@@ -521,6 +649,8 @@ pub async fn spawn_local_socks5_server(
                 }
             });
         }
+
+        Ok(())
     }))
 }
 
@@ -873,7 +1003,7 @@ async fn handle_udp_associate(
 
                 client_udp_addr = Some(source_addr);
                 let (target, payload) = parse_udp_packet(&client_buf[..len])?;
-                let upstream_addr = resolve_target_addr(&target).await?;
+                let upstream_addr = resolve_target_addr(&target, runtime.clone()).await?;
                 relay_upstream
                     .send_to(payload, upstream_addr)
                     .await
@@ -943,7 +1073,35 @@ async fn relay_tcp_until_idle(
                     }
                     continue;
                 }
-                upstream.write_all(&client_buf[..read]).await.map_err(Error::Io)?;
+                if let Err(err) = relay_write_with_timeout(
+                    upstream,
+                    &client_buf[..read],
+                    runtime.clone(),
+                    session_id,
+                    session_generation,
+                    "upstream",
+                )
+                .await
+                {
+                    if is_benign_client_disconnect(&err) {
+                        debug!(
+                            "Local SOCKS5 session #{} stopped relaying {} bytes from client to upstream: {}",
+                            session_id,
+                            read,
+                            err
+                        );
+                    } else {
+                        warn!(
+                            "Local SOCKS5 session #{} failed relaying {} bytes from client to upstream: {}",
+                            session_id,
+                            read,
+                            err
+                        );
+                    }
+                    let _ = upstream.shutdown().await;
+                    let _ = client.shutdown().await;
+                    return Err(err);
+                }
                 idle_timer
                     .as_mut()
                     .reset(TokioInstant::now() + LOCAL_SOCKS5_TCP_RELAY_IDLE_TIMEOUT);
@@ -958,13 +1116,70 @@ async fn relay_tcp_until_idle(
                     }
                     continue;
                 }
-                client.write_all(&upstream_buf[..read]).await.map_err(Error::Io)?;
+                if let Err(err) = relay_write_with_timeout(
+                    client,
+                    &upstream_buf[..read],
+                    runtime.clone(),
+                    session_id,
+                    session_generation,
+                    "client",
+                )
+                .await
+                {
+                    if is_benign_client_disconnect(&err) {
+                        debug!(
+                            "Local SOCKS5 session #{} stopped relaying {} bytes from upstream to client: {}",
+                            session_id,
+                            read,
+                            err
+                        );
+                    } else {
+                        warn!(
+                            "Local SOCKS5 session #{} failed relaying {} bytes from upstream to client: {}",
+                            session_id,
+                            read,
+                            err
+                        );
+                    }
+                    let _ = upstream.shutdown().await;
+                    let _ = client.shutdown().await;
+                    return Err(err);
+                }
                 idle_timer
                     .as_mut()
                     .reset(TokioInstant::now() + LOCAL_SOCKS5_TCP_RELAY_IDLE_TIMEOUT);
             }
             else => return Ok(()),
         }
+    }
+}
+
+async fn relay_write_with_timeout(
+    stream: &mut TcpStream,
+    buf: &[u8],
+    runtime: Arc<LocalSocks5Runtime>,
+    session_id: u64,
+    session_generation: u64,
+    destination: &str,
+) -> Result<()> {
+    let write_res = tokio::select! {
+        write_res = timeout(LOCAL_SOCKS5_TCP_RELAY_WRITE_TIMEOUT, stream.write_all(buf)) => write_res,
+        _ = runtime.wait_for_generation_change(session_generation) => {
+            return Err(Error::Session(
+                "AIVPN tunnel reset during local SOCKS5 relay".into(),
+            ));
+        }
+    };
+
+    match write_res {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(Error::Io(err)),
+        Err(_) => Err(Error::Session(format!(
+            "Local SOCKS5 session #{} write to {} timed out after {}s",
+            session_id,
+            destination,
+            LOCAL_SOCKS5_TCP_RELAY_WRITE_TIMEOUT.as_secs()
+        ))),
     }
 }
 
@@ -984,7 +1199,7 @@ async fn connect_target(
     let target_addr = match &target {
         TargetAddr::Socket(addr) => *addr,
         TargetAddr::Domain(host, port) => {
-            resolve_target_addr(&TargetAddr::Domain(host.clone(), *port))
+            resolve_target_addr(&TargetAddr::Domain(host.clone(), *port), runtime.clone())
                 .await
                 .map_err(|error| ConnectTargetFailure {
                     error,
@@ -1129,19 +1344,52 @@ async fn create_namespace_udp_socket(
     UdpSocket::from_std(std_socket).map_err(Error::Io)
 }
 
-async fn resolve_target_addr(target: &TargetAddr) -> Result<SocketAddr> {
+fn normalize_dns_cache_key(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn is_temporary_dns_lookup_error(err: &io::Error) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("try again") || message.contains("temporary failure")
+}
+
+async fn resolve_target_addr(target: &TargetAddr, runtime: Arc<LocalSocks5Runtime>) -> Result<SocketAddr> {
     match target {
         TargetAddr::Socket(addr) => Ok(*addr),
-        TargetAddr::Domain(host, port) => lookup_host((host.as_str(), *port))
-            .await
-            .map_err(Error::Io)?
-            .next()
-            .ok_or_else(|| {
-                Error::Io(io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    format!("Could not resolve SOCKS5 target {host}:{port}"),
-                ))
-            }),
+        TargetAddr::Domain(host, port) => {
+            if let Some(addr) = runtime.cached_target_addr(host, *port, false) {
+                return Ok(addr);
+            }
+
+            match timeout(LOCAL_SOCKS5_DNS_RESOLVE_TIMEOUT, lookup_host((host.as_str(), *port))).await {
+                Ok(Ok(addrs)) => {
+                    let resolved_addrs: Vec<_> = addrs.collect();
+                    let first_addr = resolved_addrs.first().copied().ok_or_else(|| {
+                        Error::Io(io::Error::new(
+                            io::ErrorKind::AddrNotAvailable,
+                            format!("Could not resolve SOCKS5 target {host}:{port}"),
+                        ))
+                    })?;
+                    runtime.cache_target_addrs(host, resolved_addrs.iter().copied());
+                    Ok(first_addr)
+                }
+                Ok(Err(err)) => {
+                    if is_temporary_dns_lookup_error(&err) {
+                        if let Some(addr) = runtime.cached_target_addr(host, *port, true) {
+                            return Ok(addr);
+                        }
+                    }
+                    Err(Error::Io(err))
+                }
+                Err(_) => Err(Error::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "Timed out resolving SOCKS5 target {host}:{port} after {}s",
+                        LOCAL_SOCKS5_DNS_RESOLVE_TIMEOUT.as_secs()
+                    ),
+                ))),
+            }
+        }
     }
 }
 
@@ -1289,20 +1537,25 @@ fn build_udp_packet(source_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
 
 fn map_error_to_reply(err: &Error) -> u8 {
     match err {
-        Error::Io(io_err) => match io_err.kind() {
-            io::ErrorKind::ConnectionRefused => SOCKS5_REPLY_CONNECTION_REFUSED,
-            io::ErrorKind::PermissionDenied => SOCKS5_REPLY_CONNECTION_NOT_ALLOWED,
-            io::ErrorKind::HostUnreachable | io::ErrorKind::TimedOut => {
-                SOCKS5_REPLY_HOST_UNREACHABLE
+        Error::Io(io_err) => {
+            if is_temporary_dns_lookup_error(io_err) {
+                return SOCKS5_REPLY_HOST_UNREACHABLE;
             }
-            io::ErrorKind::NetworkUnreachable | io::ErrorKind::NetworkDown => {
-                SOCKS5_REPLY_NETWORK_UNREACHABLE
+            match io_err.kind() {
+                io::ErrorKind::ConnectionRefused => SOCKS5_REPLY_CONNECTION_REFUSED,
+                io::ErrorKind::PermissionDenied => SOCKS5_REPLY_CONNECTION_NOT_ALLOWED,
+                io::ErrorKind::HostUnreachable | io::ErrorKind::TimedOut => {
+                    SOCKS5_REPLY_HOST_UNREACHABLE
+                }
+                io::ErrorKind::NetworkUnreachable | io::ErrorKind::NetworkDown => {
+                    SOCKS5_REPLY_NETWORK_UNREACHABLE
+                }
+                io::ErrorKind::AddrNotAvailable | io::ErrorKind::InvalidInput => {
+                    SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED
+                }
+                _ => SOCKS5_REPLY_GENERAL_FAILURE,
             }
-            io::ErrorKind::AddrNotAvailable | io::ErrorKind::InvalidInput => {
-                SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED
-            }
-            _ => SOCKS5_REPLY_GENERAL_FAILURE,
-        },
+        }
         Error::Session(message) if message.contains("address type") => {
             SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED
         }
@@ -1370,8 +1623,13 @@ mod tests {
             );
         }
 
-        assert!(!runtime.is_ready());
-        assert!(runtime.current_reconnect_generation() > reconnect_generation);
+        if LOCAL_SOCKS5_ENABLE_AUTO_RECONNECT {
+            assert!(!runtime.is_ready());
+            assert!(runtime.current_reconnect_generation() > reconnect_generation);
+        } else {
+            assert!(runtime.is_ready());
+            assert_eq!(runtime.current_reconnect_generation(), reconnect_generation);
+        }
     }
 
     #[test]
@@ -1406,7 +1664,87 @@ mod tests {
             );
         }
 
-        assert!(!runtime.is_ready());
-        assert!(runtime.current_reconnect_generation() > reconnect_generation);
+        if LOCAL_SOCKS5_ENABLE_AUTO_RECONNECT {
+            assert!(!runtime.is_ready());
+            assert!(runtime.current_reconnect_generation() > reconnect_generation);
+        } else {
+            assert!(runtime.is_ready());
+            assert_eq!(runtime.current_reconnect_generation(), reconnect_generation);
+        }
+    }
+
+    #[test]
+    fn runtime_does_not_request_reconnect_after_ready_timeout_burst_with_recent_server_activity() {
+        let runtime = LocalSocks5Runtime::new(1);
+        let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        runtime.set_ready(true);
+        runtime.observe_server_packet();
+        let reconnect_generation = runtime.current_reconnect_generation();
+
+        for _ in 0..LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
+            runtime.observe_connect_timeout(
+                "8.8.4.4:443",
+                peer_addr,
+                "simulated timeout",
+            );
+        }
+
+        assert!(runtime.is_ready());
+        assert_eq!(runtime.current_reconnect_generation(), reconnect_generation);
+    }
+
+    #[test]
+    fn dns_cache_returns_fresh_entries_in_round_robin_order() {
+        let runtime = LocalSocks5Runtime::new(1);
+        runtime.cache_target_addrs(
+            "I.Instagram.Com.",
+            [
+                "157.240.229.174:443".parse().unwrap(),
+                "157.240.229.174:80".parse().unwrap(),
+                "157.240.229.63:443".parse().unwrap(),
+            ],
+        );
+
+        assert_eq!(
+            runtime.cached_target_addr("i.instagram.com", 8443, false),
+            Some("157.240.229.174:8443".parse().unwrap())
+        );
+        assert_eq!(
+            runtime.cached_target_addr("i.instagram.com", 8443, false),
+            Some("157.240.229.63:8443".parse().unwrap())
+        );
+        assert_eq!(
+            runtime.cached_target_addr("i.instagram.com", 8443, false),
+            Some("157.240.229.174:8443".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn dns_cache_uses_stale_entries_only_when_allowed() {
+        let runtime = LocalSocks5Runtime::new(1);
+        runtime.cache_target_addrs("mask.icloud.com", ["17.253.31.201:443".parse().unwrap()]);
+
+        {
+            let mut cache = runtime.dns_cache.lock().unwrap();
+            let entry = cache.get_mut("mask.icloud.com").unwrap();
+            entry.expires_at = Instant::now() - Duration::from_secs(1);
+            entry.stale_expires_at = Instant::now() + Duration::from_secs(30);
+        }
+
+        assert_eq!(runtime.cached_target_addr("mask.icloud.com", 443, false), None);
+        assert_eq!(
+            runtime.cached_target_addr("mask.icloud.com", 443, true),
+            Some("17.253.31.201:443".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn relay_write_timeout_is_not_treated_as_benign_disconnect() {
+        assert!(!is_benign_client_disconnect(&Error::Session(
+            format!(
+                "Local SOCKS5 session #42 write to upstream timed out after {}s",
+                LOCAL_SOCKS5_TCP_RELAY_WRITE_TIMEOUT.as_secs()
+            ),
+        )));
     }
 }

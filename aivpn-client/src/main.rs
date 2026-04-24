@@ -651,8 +651,8 @@ mod tests {
         let local_socks5 = settings.local_socks5.unwrap();
         assert_eq!(local_socks5.host, "127.0.0.1");
         assert_eq!(local_socks5.port, 1080);
-        assert_eq!(local_socks5.max_clients, 256);
-        assert_eq!(local_socks5.max_concurrent_dials, 128);
+        assert_eq!(local_socks5.max_clients, 1024);
+        assert_eq!(local_socks5.max_concurrent_dials, 512);
     }
 
     #[test]
