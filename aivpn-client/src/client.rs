@@ -38,6 +38,7 @@ use crate::netns::NetworkNamespace;
 use crate::tunnel::{Tunnel, TunnelConfig};
 
 const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const SERVER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,7 @@ pub struct AivpnClient {
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
     socks_namespace: Option<Arc<NetworkNamespace>>,
+    server_handshake_complete: bool,
     // Pre-allocated buffers for zero-copy I/O (OPTIMIZATION)
     _send_buf: Vec<u8>,
     _recv_buf: Vec<u8>,
@@ -130,6 +132,7 @@ impl AivpnClient {
             bytes_sent: bytes_sent.clone(),
             bytes_received: bytes_received.clone(),
             socks_namespace: None,
+            server_handshake_complete: false,
             // Pre-allocate buffers to MAX_PACKET_SIZE to avoid reallocations
             _send_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             _recv_buf: Vec::with_capacity(MAX_PACKET_SIZE),
@@ -140,6 +143,7 @@ impl AivpnClient {
     pub async fn connect(&mut self) -> Result<()> {
         info!("Connecting to AIVPN server...");
         self.state = ClientState::Connecting;
+        self.server_handshake_complete = false;
 
         let server_addr: SocketAddr = self.config.server_addr.parse()
             .map_err(|e: std::net::AddrParseError| Error::Io(
@@ -277,6 +281,7 @@ impl AivpnClient {
         self.upload_state = None;
         self.transition_recv_keys = None;
         self.transition_recv_deadline = None;
+        self.server_handshake_complete = false;
     }
     
     /// Run the client main loop
@@ -285,6 +290,7 @@ impl AivpnClient {
 
         // Send initial handshake packet with eph_pub to establish session
         self.send_init().await?;
+        let handshake_started_at = Instant::now();
 
         info!("Starting client main loop");
         info!("Routing traffic through AIVPN tunnel...");
@@ -423,10 +429,6 @@ impl AivpnClient {
             upload_bytes_sent,
         ));
 
-        if let Some(runtime) = &self.config.local_socks5_runtime {
-            runtime.set_ready(true);
-            info!("Local SOCKS5 dataplane is ready");
-        }
         let local_socks_reconnect_generation = self
             .config
             .local_socks5_runtime
@@ -462,6 +464,24 @@ impl AivpnClient {
                             stats_task.abort();
                             break Err(Error::Session(reconnect_reason));
                         }
+                    }
+
+                    if !self.server_handshake_complete
+                        && handshake_started_at.elapsed() >= SERVER_HANDSHAKE_TIMEOUT
+                    {
+                        if let Some(runtime) = &self.config.local_socks5_runtime {
+                            runtime.set_ready(false);
+                            runtime.reset_active_sessions();
+                        }
+                        warn!(
+                            "Server handshake timeout after {}s without ServerHello; reconnecting client session",
+                            SERVER_HANDSHAKE_TIMEOUT.as_secs()
+                        );
+                        stats_task.abort();
+                        break Err(Error::Session(format!(
+                            "Server handshake timeout after {}s without ServerHello",
+                            SERVER_HANDSHAKE_TIMEOUT.as_secs()
+                        )));
                     }
 
                     let inactive_for_ms = crypto::current_timestamp_ms()
@@ -689,6 +709,11 @@ impl AivpnClient {
                     info!("Outbound ratchet activated — upload switched to new keys");
                 }
                 info!("PFS ratchet complete — forward secrecy established");
+                self.server_handshake_complete = true;
+                if let Some(runtime) = &self.config.local_socks5_runtime {
+                    runtime.set_ready(true);
+                    info!("Local SOCKS5 dataplane is ready");
+                }
             }
             ControlPayload::Keepalive => {
                 debug!("Keepalive from server");

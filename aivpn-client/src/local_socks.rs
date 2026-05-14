@@ -37,6 +37,8 @@ const SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 const DEFAULT_LOCAL_SOCKS5_MAX_CLIENTS: usize = 1024;
 const DEFAULT_LOCAL_SOCKS5_MAX_CONCURRENT_DIALS: usize = 512;
 const LOCAL_SOCKS5_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+const LOCAL_SOCKS5_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
+const LOCAL_SOCKS5_READY_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 const LOCAL_SOCKS5_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCAL_SOCKS5_QUEUE_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 const LOCAL_SOCKS5_SLOW_CONNECT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
@@ -52,7 +54,7 @@ const LOCAL_SOCKS5_DNS_CACHE_TTL: Duration = Duration::from_secs(60);
 const LOCAL_SOCKS5_DNS_CACHE_STALE_GRACE: Duration = Duration::from_secs(300);
 const LOCAL_SOCKS5_DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_SOCKS5_TCP_RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(180);
-const LOCAL_SOCKS5_ENABLE_AUTO_RECONNECT: bool = false;
+const LOCAL_SOCKS5_ENABLE_AUTO_RECONNECT: bool = true;
 const LOCAL_SOCKS5_UNAVAILABLE_LOG_THROTTLE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -131,6 +133,7 @@ impl LocalSocks5Config {
 #[derive(Debug)]
 pub struct LocalSocks5Runtime {
     ready: AtomicBool,
+    ready_notify: Notify,
     namespace: RwLock<Option<Arc<NetworkNamespace>>>,
     dial_slots: Arc<Semaphore>,
     max_concurrent_dials: usize,
@@ -180,6 +183,7 @@ impl LocalSocks5Runtime {
     pub fn new(max_concurrent_dials: usize) -> Self {
         Self {
             ready: AtomicBool::new(false),
+            ready_notify: Notify::new(),
             namespace: RwLock::new(None),
             dial_slots: Arc::new(Semaphore::new(max_concurrent_dials)),
             max_concurrent_dials,
@@ -205,6 +209,29 @@ impl LocalSocks5Runtime {
             if let Ok(mut diagnostics) = self.diagnostics.lock() {
                 diagnostics.last_unavailable_log_at = None;
                 diagnostics.last_reconnect_reason = None;
+            }
+            self.ready_notify.notify_waiters();
+        }
+    }
+
+    pub async fn wait_until_ready(&self, wait_timeout: Duration) -> bool {
+        if self.is_ready() {
+            return true;
+        }
+
+        let deadline = TokioInstant::now() + wait_timeout;
+        let sleep = sleep_until(deadline);
+        tokio::pin!(sleep);
+
+        loop {
+            let notified = self.ready_notify.notified();
+            if self.is_ready() {
+                return true;
+            }
+
+            tokio::select! {
+                _ = &mut sleep => return self.is_ready(),
+                _ = notified => {}
             }
         }
     }
@@ -701,8 +728,6 @@ async fn handle_client(
             )));
         }
     };
-    let session_generation = runtime.current_generation();
-
     match command {
         SOCKS5_CMD_CONNECT => {
             handle_connect(
@@ -711,7 +736,6 @@ async fn handle_client(
                 peer_addr,
                 runtime,
                 session_id,
-                session_generation,
             )
             .await
         }
@@ -722,7 +746,6 @@ async fn handle_client(
                 peer_addr,
                 runtime,
                 session_id,
-                session_generation,
             )
             .await
         }
@@ -798,7 +821,6 @@ async fn handle_connect(
     peer_addr: SocketAddr,
     runtime: Arc<LocalSocks5Runtime>,
     session_id: u64,
-    session_generation: u64,
 ) -> Result<()> {
     let target_display = target.display();
     debug!(
@@ -806,18 +828,28 @@ async fn handle_connect(
         session_id, peer_addr, target_display
     );
 
-    if !runtime.is_ready() {
-        runtime.observe_network_unreachable_reply(
-            &target_display,
-            peer_addr,
-            "AIVPN tunnel is reconnecting or not ready yet",
-        );
-        let reply_addr = unspecified_addr_for_peer(peer_addr);
-        send_reply(client, SOCKS5_REPLY_NETWORK_UNREACHABLE, reply_addr).await?;
-        return Err(Error::Session(
-            "AIVPN tunnel unavailable for local SOCKS5 CONNECT".into(),
-        ));
-    }
+    let session_generation = match wait_for_dataplane_ready(
+        runtime.as_ref(),
+        session_id,
+        peer_addr,
+        &target_display,
+    )
+    .await
+    {
+        Some(generation) => generation,
+        None => {
+            let detail = format!(
+                "AIVPN tunnel is reconnecting or did not become ready within {}ms",
+                LOCAL_SOCKS5_READY_WAIT_TIMEOUT.as_millis()
+            );
+            runtime.observe_network_unreachable_reply(&target_display, peer_addr, &detail);
+            let reply_addr = unspecified_addr_for_peer(peer_addr);
+            send_reply(client, SOCKS5_REPLY_NETWORK_UNREACHABLE, reply_addr).await?;
+            return Err(Error::Session(
+                "AIVPN tunnel unavailable for local SOCKS5 CONNECT".into(),
+            ));
+        }
+    };
 
     let queue_started = Instant::now();
     let available_before_queue = runtime.available_dial_slots();
@@ -899,13 +931,45 @@ async fn handle_connect(
     }
 }
 
+async fn wait_for_dataplane_ready(
+    runtime: &LocalSocks5Runtime,
+    session_id: u64,
+    peer_addr: SocketAddr,
+    target_display: &str,
+) -> Option<u64> {
+    if runtime.is_ready() {
+        return Some(runtime.current_generation());
+    }
+
+    let wait_started = Instant::now();
+    let became_ready = runtime
+        .wait_until_ready(LOCAL_SOCKS5_READY_WAIT_TIMEOUT)
+        .await;
+    let wait_elapsed = wait_started.elapsed();
+
+    if !became_ready {
+        return None;
+    }
+
+    if wait_elapsed >= LOCAL_SOCKS5_READY_WAIT_LOG_THRESHOLD {
+        info!(
+            "Local SOCKS5 session #{} waited {:?} for the AIVPN dataplane before continuing to {} (peer {})",
+            session_id,
+            wait_elapsed,
+            target_display,
+            peer_addr
+        );
+    }
+
+    Some(runtime.current_generation())
+}
+
 async fn handle_udp_associate(
     client: &mut TcpStream,
     target: TargetAddr,
     peer_addr: SocketAddr,
     runtime: Arc<LocalSocks5Runtime>,
     session_id: u64,
-    session_generation: u64,
 ) -> Result<()> {
     let target_display = target.display();
     debug!(
@@ -915,18 +979,28 @@ async fn handle_udp_associate(
         target_display
     );
 
-    if !runtime.is_ready() {
-        runtime.observe_network_unreachable_reply(
-            &target_display,
-            peer_addr,
-            "AIVPN tunnel is reconnecting or not ready yet",
-        );
-        let reply_addr = unspecified_addr_for_peer(peer_addr);
-        send_reply(client, SOCKS5_REPLY_NETWORK_UNREACHABLE, reply_addr).await?;
-        return Err(Error::Session(
-            "AIVPN tunnel unavailable for local SOCKS5 UDP ASSOCIATE".into(),
-        ));
-    }
+    let session_generation = match wait_for_dataplane_ready(
+        runtime.as_ref(),
+        session_id,
+        peer_addr,
+        &target_display,
+    )
+    .await
+    {
+        Some(generation) => generation,
+        None => {
+            let detail = format!(
+                "AIVPN tunnel is reconnecting or did not become ready within {}ms",
+                LOCAL_SOCKS5_READY_WAIT_TIMEOUT.as_millis()
+            );
+            runtime.observe_network_unreachable_reply(&target_display, peer_addr, &detail);
+            let reply_addr = unspecified_addr_for_peer(peer_addr);
+            send_reply(client, SOCKS5_REPLY_NETWORK_UNREACHABLE, reply_addr).await?;
+            return Err(Error::Session(
+                "AIVPN tunnel unavailable for local SOCKS5 UDP ASSOCIATE".into(),
+            ));
+        }
+    };
 
     let client_bind_addr = client.local_addr().map_err(Error::Io)?;
     let relay_client = UdpSocket::bind(SocketAddr::new(client_bind_addr.ip(), 0))
@@ -1623,13 +1697,8 @@ mod tests {
             );
         }
 
-        if LOCAL_SOCKS5_ENABLE_AUTO_RECONNECT {
-            assert!(!runtime.is_ready());
-            assert!(runtime.current_reconnect_generation() > reconnect_generation);
-        } else {
-            assert!(runtime.is_ready());
-            assert_eq!(runtime.current_reconnect_generation(), reconnect_generation);
-        }
+        assert!(!runtime.is_ready());
+        assert!(runtime.current_reconnect_generation() > reconnect_generation);
     }
 
     #[test]
@@ -1664,13 +1733,8 @@ mod tests {
             );
         }
 
-        if LOCAL_SOCKS5_ENABLE_AUTO_RECONNECT {
-            assert!(!runtime.is_ready());
-            assert!(runtime.current_reconnect_generation() > reconnect_generation);
-        } else {
-            assert!(runtime.is_ready());
-            assert_eq!(runtime.current_reconnect_generation(), reconnect_generation);
-        }
+        assert!(!runtime.is_ready());
+        assert!(runtime.current_reconnect_generation() > reconnect_generation);
     }
 
     #[test]
@@ -1746,5 +1810,18 @@ mod tests {
                 LOCAL_SOCKS5_TCP_RELAY_WRITE_TIMEOUT.as_secs()
             ),
         )));
+    }
+
+    #[tokio::test]
+    async fn runtime_wait_until_ready_observes_state_transition() {
+        let runtime = Arc::new(LocalSocks5Runtime::new(1));
+        let runtime_for_task = runtime.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            runtime_for_task.set_ready(true);
+        });
+
+        assert!(runtime.wait_until_ready(Duration::from_secs(1)).await);
     }
 }
