@@ -3,6 +3,8 @@
 //! Both the CLI client and Android core use this module to avoid duplicating
 //! the biased-select + burst-drain + keepalive upload loop.
 
+use std::future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +25,11 @@ pub struct UploadConfig {
     pub burst_size: usize,
     /// How often a keepalive is sent when there is no data traffic.
     pub keepalive_interval: Duration,
+    /// Optional interval for retransmitting the session-init control packet
+    /// until the caller marks the server handshake complete.
+    pub handshake_retry_interval: Option<Duration>,
+    /// Shared completion flag used with `handshake_retry_interval`.
+    pub handshake_complete: Option<Arc<AtomicBool>>,
 }
 
 impl Default for UploadConfig {
@@ -30,6 +37,8 @@ impl Default for UploadConfig {
         Self {
             burst_size: 63,
             keepalive_interval: Duration::from_secs(25),
+            handshake_retry_interval: None,
+            handshake_complete: None,
         }
     }
 }
@@ -46,6 +55,14 @@ pub trait PacketEncryptor: Send {
     fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>>;
     /// Encrypt a keepalive control message into a ready-to-send UDP datagram.
     fn encrypt_keepalive(&mut self) -> Result<Vec<u8>>;
+    /// Encrypt a handshake retry control message.
+    ///
+    /// Most clients do not need a distinct packet here. The CLI SOCKS/TUN
+    /// client overrides this to include its obfuscated ephemeral public key so
+    /// either a lost init packet or a lost ServerHello can be recovered.
+    fn encrypt_handshake_retry(&mut self) -> Result<Vec<u8>> {
+        self.encrypt_keepalive()
+    }
     /// Called after a data datagram has been successfully sent.
     /// Use this for stats tracking, FSM transitions, etc.
     fn on_data_sent(&mut self, payload_len: usize);
@@ -110,6 +127,15 @@ async fn send_tolerant(udp: &UdpSocket, data: &[u8]) -> Result<()> {
     }
 }
 
+async fn optional_interval_tick(interval: &mut Option<time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => future::pending::<()>().await,
+    }
+}
+
 /// Run the upload loop: pull TUN packets from `rx`, encrypt via `enc`, send
 /// over `udp`. Uses biased `select!` to prioritise data over keepalives and a
 /// burst-drain after the first recv to amortise per-packet scheduler overhead.
@@ -123,14 +149,33 @@ pub async fn run_upload_loop(
     config: &UploadConfig,
 ) -> Result<()> {
     let mut ka_interval = time::interval(config.keepalive_interval);
+    let mut handshake_retry_interval = config.handshake_retry_interval.map(time::interval);
     let mut data_packet_count: u64 = 0;
     ka_interval.tick().await; // skip the immediate first tick
+    if let Some(interval) = &mut handshake_retry_interval {
+        interval.tick().await; // skip the immediate first tick
+    }
 
     loop {
+        let should_retry_handshake = handshake_retry_interval.is_some()
+            && config
+                .handshake_complete
+                .as_ref()
+                .is_some_and(|complete| !complete.load(Ordering::SeqCst));
+
         tokio::select! {
             biased;
 
-            // ── Data path (highest priority) ──
+            // Session-init retry: disabled by default. When enabled, this
+            // branch keeps the handshake recoverable if the first UDP init or
+            // the first ServerHello is lost. Keep it above data while the
+            // handshake is incomplete so a busy TUN queue cannot starve it.
+            _ = optional_interval_tick(&mut handshake_retry_interval), if should_retry_handshake => {
+                let encrypted = enc.encrypt_handshake_retry()?;
+                send_tolerant(udp, &encrypted).await?;
+            }
+
+            // ── Data path ──
             maybe_pkt = rx.recv() => {
                 let pkt_data = match maybe_pkt {
                     Some(p) => p,
@@ -161,7 +206,11 @@ pub async fn run_upload_loop(
 
             // ── Keepalive (fires only when data path is idle) ──
             _ = ka_interval.tick() => {
-                let encrypted = enc.encrypt_keepalive()?;
+                let encrypted = if should_retry_handshake {
+                    enc.encrypt_handshake_retry()?
+                } else {
+                    enc.encrypt_keepalive()?
+                };
                 send_tolerant(udp, &encrypted).await?;
             }
         }

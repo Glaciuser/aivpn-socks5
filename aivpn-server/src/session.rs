@@ -25,6 +25,8 @@ use aivpn_common::error::{Error, Result};
 
 /// Maximum sessions on 1GB VPS
 pub const MAX_SESSIONS: usize = 500;
+const MAX_SESSIONS_PER_IP: usize = 5;
+const STALE_PRE_RATCHET_SESSION_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Session idle timeout
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -450,11 +452,17 @@ impl SessionManager {
             return Err(Error::Session("Max sessions reached".into()));
         }
         
-        // MED-6: Per-IP session limit (max 5 sessions per IP)
+        // MED-6: Per-IP session limit. Stale pre-ratchet sessions can be left
+        // behind when the client never receives ServerHello; remove only those
+        // expired handshakes before enforcing the limit.
+        self.cleanup_stale_pre_ratchet_sessions_for_ip(
+            &client_addr.ip(),
+            STALE_PRE_RATCHET_SESSION_TIMEOUT,
+        );
         let ip_count = self.sessions.iter()
             .filter(|e| e.value().lock().client_addr.ip() == client_addr.ip())
             .count();
-        if ip_count >= 5 {
+        if ip_count >= MAX_SESSIONS_PER_IP {
             return Err(Error::Session("Per-IP session limit reached".into()));
         }
         
@@ -592,6 +600,36 @@ impl SessionManager {
             info!("Removing stale session for VPN IP {} after successful re-handshake", vpn_ip);
             self.remove_session(&session_id);
         }
+    }
+
+    pub fn cleanup_stale_pre_ratchet_sessions_for_ip(
+        &self,
+        ip: &std::net::IpAddr,
+        max_idle: Duration,
+    ) -> usize {
+        let to_remove: Vec<[u8; 16]> = self.sessions.iter()
+            .filter_map(|entry| {
+                let session = entry.value().lock();
+                if session.client_addr.ip() == *ip
+                    && !session.is_ratcheted
+                    && session.last_seen.elapsed() >= max_idle
+                {
+                    Some(*entry.key())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let removed = to_remove.len();
+        for session_id in to_remove {
+            info!(
+                "Removing stale pre-ratchet session for IP {} before accepting a new handshake",
+                ip
+            );
+            self.remove_session(&session_id);
+        }
+        removed
     }
 
     /// Rollback a session that was created but failed tag validation.
@@ -971,5 +1009,72 @@ impl SessionManager {
         packet.extend_from_slice(&ciphertext);
 
         Ok(packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
+
+    fn test_session_manager() -> SessionManager {
+        SessionManager::new(
+            KeyPair::generate(),
+            ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]),
+            webrtc_zoom_v3(),
+        )
+    }
+
+    fn test_client_addr(port: u16) -> SocketAddr {
+        SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), port)
+    }
+
+    fn test_eph_pub() -> [u8; X25519_PUBLIC_KEY_SIZE] {
+        KeyPair::generate().public_key_bytes()
+    }
+
+    #[test]
+    fn stale_pre_ratchet_sessions_do_not_block_new_handshake() {
+        let sessions = test_session_manager();
+
+        for port in 10_000..10_000 + MAX_SESSIONS_PER_IP as u16 {
+            sessions
+                .create_session(test_client_addr(port), test_eph_pub(), None, None)
+                .unwrap();
+        }
+
+        for entry in sessions.sessions.iter() {
+            let session = entry.value();
+            session.lock().last_seen =
+                Instant::now() - STALE_PRE_RATCHET_SESSION_TIMEOUT - Duration::from_secs(1);
+        }
+
+        assert_eq!(sessions.session_count(), MAX_SESSIONS_PER_IP);
+
+        sessions
+            .create_session(test_client_addr(20_000), test_eph_pub(), None, None)
+            .unwrap();
+
+        assert_eq!(sessions.session_count(), 1);
+    }
+
+    #[test]
+    fn fresh_pre_ratchet_sessions_still_enforce_per_ip_limit() {
+        let sessions = test_session_manager();
+
+        for port in 10_000..10_000 + MAX_SESSIONS_PER_IP as u16 {
+            sessions
+                .create_session(test_client_addr(port), test_eph_pub(), None, None)
+                .unwrap();
+        }
+
+        let err = match sessions.create_session(test_client_addr(20_000), test_eph_pub(), None, None)
+        {
+            Ok(_) => panic!("expected per-IP session limit error"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("Per-IP session limit reached"));
+        assert_eq!(sessions.session_count(), MAX_SESSIONS_PER_IP);
     }
 }

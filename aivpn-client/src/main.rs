@@ -4,7 +4,7 @@ use std::fs;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aivpn_client::AivpnClient;
 use aivpn_client::client::{ClientConfig, ClientMode};
@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -258,8 +259,8 @@ async fn main() {
             server_signing_pub: None,
         };
 
-        let reconnect_delay = backoff;
-        let advance_backoff = true;
+        let mut reconnect_delay = backoff;
+        let mut advance_backoff = true;
 
         match AivpnClient::new(config) {
             Ok(mut client) => {
@@ -271,15 +272,28 @@ async fn main() {
                 let _ = fs::write("/var/run/aivpn/traffic.stats", "sent:0,received:0");
                 let _ = fs::write("/tmp/aivpn-traffic.stats", "sent:0,received:0");
 
+                let run_started = Instant::now();
                 match client.run(shutdown.clone()).await {
                     Ok(()) => break,
                     Err(err) => {
                         reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        let run_elapsed = run_started.elapsed();
+                        let err_text = err.to_string();
+                        let local_socks_requested_reconnect = settings.mode == RuntimeMode::Socks5
+                            && err_text.contains("Local SOCKS5")
+                            && err_text.contains("reconnect");
+
+                        if local_socks_requested_reconnect || run_elapsed >= RECONNECT_BACKOFF_RESET_AFTER {
+                            reconnect_delay = Duration::ZERO;
+                            advance_backoff = false;
+                            backoff = INITIAL_RECONNECT_BACKOFF;
+                        }
+
                         warn!(
                             "Client run failed: {}. Reconnect attempt #{} in {}s",
-                            err,
+                            err_text,
                             reconnect_attempt,
-                            backoff.as_secs()
+                            reconnect_delay.as_secs()
                         );
                     }
                 }
@@ -290,7 +304,7 @@ async fn main() {
                     "Failed to create client: {}. Reconnect attempt #{} in {}s",
                     err,
                     reconnect_attempt,
-                    backoff.as_secs()
+                    reconnect_delay.as_secs()
                 );
             }
         }

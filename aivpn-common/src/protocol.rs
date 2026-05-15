@@ -131,10 +131,10 @@ impl AivpnPacket {
 
     /// Serialize packet to bytes
     pub fn to_bytes(&self) -> BytesMut {
-        let total_len = TAG_SIZE 
-            + self.mask_dependent_header.len() 
+        let total_len = TAG_SIZE
+            + self.mask_dependent_header.len()
             + 2 // pad_len
-            + self.encrypted_payload.len() 
+            + self.encrypted_payload.len()
             + self.random_padding.len();
         
         let mut buf = BytesMut::with_capacity(total_len);

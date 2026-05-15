@@ -38,6 +38,7 @@ use crate::netns::NetworkNamespace;
 use crate::tunnel::{Tunnel, TunnelConfig};
 
 const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const CLIENT_HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const SERVER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -100,6 +101,7 @@ pub struct AivpnClient {
     bytes_received: Arc<AtomicU64>,
     socks_namespace: Option<Arc<NetworkNamespace>>,
     server_handshake_complete: bool,
+    server_handshake_complete_flag: Arc<AtomicBool>,
     // Pre-allocated buffers for zero-copy I/O (OPTIMIZATION)
     _send_buf: Vec<u8>,
     _recv_buf: Vec<u8>,
@@ -133,6 +135,7 @@ impl AivpnClient {
             bytes_received: bytes_received.clone(),
             socks_namespace: None,
             server_handshake_complete: false,
+            server_handshake_complete_flag: Arc::new(AtomicBool::new(false)),
             // Pre-allocate buffers to MAX_PACKET_SIZE to avoid reallocations
             _send_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             _recv_buf: Vec::with_capacity(MAX_PACKET_SIZE),
@@ -144,6 +147,7 @@ impl AivpnClient {
         info!("Connecting to AIVPN server...");
         self.state = ClientState::Connecting;
         self.server_handshake_complete = false;
+        self.server_handshake_complete_flag.store(false, Ordering::SeqCst);
 
         let server_addr: SocketAddr = self.config.server_addr.parse()
             .map_err(|e: std::net::AddrParseError| Error::Io(
@@ -282,6 +286,7 @@ impl AivpnClient {
         self.transition_recv_keys = None;
         self.transition_recv_deadline = None;
         self.server_handshake_complete = false;
+        self.server_handshake_complete_flag.store(false, Ordering::SeqCst);
     }
     
     /// Run the client main loop
@@ -411,6 +416,9 @@ impl AivpnClient {
         let upload_seq = self.send_seq as u16;
         let upload_counter = self.counter;
         let upload_bytes_sent = self.bytes_sent.clone();
+        let handshake_obfuscated_eph_pub =
+            obfuscate_client_eph_pub(&self.keypair, &self.config.server_public_key);
+        let server_handshake_complete_flag = self.server_handshake_complete_flag.clone();
         let upload_state = Arc::new(Mutex::new(UploadCryptoState {
             keys: upload_keys,
             counter: upload_counter,
@@ -426,6 +434,8 @@ impl AivpnClient {
             upload_udp,
             upload_engine,
             upload_state,
+            handshake_obfuscated_eph_pub,
+            server_handshake_complete_flag,
             upload_bytes_sent,
         ));
 
@@ -551,12 +561,16 @@ impl AivpnClient {
         udp: Arc<UdpSocket>,
         engine: MimicryEngine,
         upload_state: Arc<Mutex<UploadCryptoState>>,
+        handshake_obfuscated_eph_pub: [u8; 32],
+        server_handshake_complete: Arc<AtomicBool>,
         bytes_sent: Arc<AtomicU64>,
     ) -> Result<()> {
         /// Wraps MimicryEngine to implement the shared PacketEncryptor trait.
         struct MimicryEncryptor {
             engine: MimicryEngine,
             upload_state: Arc<Mutex<UploadCryptoState>>,
+            handshake_obfuscated_eph_pub: [u8; 32],
+            server_handshake_complete: Arc<AtomicBool>,
             bytes_sent: Arc<AtomicU64>,
         }
 
@@ -580,14 +594,40 @@ impl AivpnClient {
                 self.engine.build_packet(&inner, &keys, &mut state.counter, None)
             }
 
+            fn encrypt_handshake_retry(&mut self) -> Result<Vec<u8>> {
+                if self.server_handshake_complete.load(Ordering::SeqCst) {
+                    return self.encrypt_keepalive();
+                }
+
+                let mut state = self.upload_state.lock().expect("upload state poisoned");
+                let keepalive = ControlPayload::Keepalive.encode()?;
+                let inner = build_inner_packet(InnerType::Control, state.seq, &keepalive);
+                state.seq = state.seq.wrapping_add(1);
+                let keys = state.keys.clone();
+                self.engine.build_packet(
+                    &inner,
+                    &keys,
+                    &mut state.counter,
+                    Some(&self.handshake_obfuscated_eph_pub),
+                )
+            }
+
             fn on_data_sent(&mut self, payload_len: usize) {
                 self.bytes_sent.fetch_add(payload_len as u64, Ordering::Relaxed);
             }
         }
 
-        let mut enc = MimicryEncryptor { engine, upload_state, bytes_sent };
+        let mut enc = MimicryEncryptor {
+            engine,
+            upload_state,
+            handshake_obfuscated_eph_pub,
+            server_handshake_complete: server_handshake_complete.clone(),
+            bytes_sent,
+        };
         let config = UploadConfig {
             keepalive_interval: CLIENT_KEEPALIVE_INTERVAL,
+            handshake_retry_interval: Some(CLIENT_HANDSHAKE_RETRY_INTERVAL),
+            handshake_complete: Some(server_handshake_complete),
             ..Default::default()
         };
         upload_pipeline::run_upload_loop(&mut rx, &udp, &mut enc, &config).await
@@ -709,6 +749,7 @@ impl AivpnClient {
                     info!("Outbound ratchet activated — upload switched to new keys");
                 }
                 info!("PFS ratchet complete — forward secrecy established");
+                self.server_handshake_complete_flag.store(true, Ordering::SeqCst);
                 self.server_handshake_complete = true;
                 if let Some(runtime) = &self.config.local_socks5_runtime {
                     runtime.set_ready(true);
