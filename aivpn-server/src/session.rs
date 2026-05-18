@@ -999,8 +999,11 @@ impl SessionManager {
             time_window,
         );
 
-        // MDH
-        let mdh = vec![0u8; 4];
+        let mdh = sess
+            .mask
+            .as_ref()
+            .map(|mask| mask.header_template.clone())
+            .unwrap_or_else(|| vec![0u8; 4]);
 
         // Assemble: TAG | MDH | ciphertext
         let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());

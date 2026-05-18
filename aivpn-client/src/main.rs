@@ -15,10 +15,7 @@ use aivpn_client::sing_box::{
 use aivpn_client::tunnel::TunnelConfig;
 use aivpn_client::AivpnClient;
 use aivpn_common::error::{Error, Result};
-use aivpn_common::mask::{
-    preset_masks::{quic_https_v2, webrtc_zoom_v3},
-    MaskProfile,
-};
+use aivpn_common::mask::{preset_masks::bootstrap_fallback_masks, MaskProfile};
 use aivpn_common::network_config::{ClientNetworkConfig, DEFAULT_VPN_MTU, LEGACY_SERVER_VPN_IP};
 use base64::Engine;
 use clap::{ArgAction, Parser, ValueEnum};
@@ -385,7 +382,7 @@ fn resolve_runtime_settings(args: &ClientArgs) -> Result<RuntimeSettings> {
 }
 
 fn handshake_fallback_masks() -> Vec<MaskProfile> {
-    vec![webrtc_zoom_v3(), quic_https_v2()]
+    bootstrap_fallback_masks()
 }
 
 fn is_server_handshake_timeout(err_text: &str) -> bool {
@@ -918,11 +915,21 @@ mod tests {
         let masks = handshake_fallback_masks();
         let ids: Vec<&str> = masks.iter().map(|mask| mask.mask_id.as_str()).collect();
 
-        assert_eq!(ids, vec!["webrtc_zoom_v3", "quic_https_v2"]);
+        assert_eq!(
+            ids,
+            vec![
+                "webrtc_zoom_v3",
+                "webrtc_yandex_telemost_v1",
+                "quic_https_v2",
+                "webrtc_vk_teams_v1",
+                "quic_grease_v1",
+                "webrtc_sberjazz_v1",
+            ]
+        );
         for mask in masks {
-            assert_eq!(mask.header_template.len(), 4);
-            assert_eq!(mask.eph_pub_offset, 4);
             assert_eq!(mask.eph_pub_length, 32);
+            assert!(mask.handshake_mdh_len() >= mask.data_mdh_len());
+            assert!(mask.handshake_mdh_len() >= mask.eph_pub_offset as usize + 32);
         }
     }
 }

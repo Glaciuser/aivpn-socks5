@@ -19,7 +19,9 @@ use aivpn_common::crypto::{
 use aivpn_common::protocol::{
     InnerHeader, InnerType, ControlPayload, ControlSubtype, AivpnPacket,
 };
-use aivpn_common::mask::preset_masks::{webrtc_zoom_v3, quic_https_v2};
+use aivpn_common::mask::preset_masks::{
+    bootstrap_fallback_masks, quic_https_v2, webrtc_zoom_v3,
+};
 use aivpn_common::mask::MaskProfile;
 use subtle::ConstantTimeEq;
 
@@ -607,7 +609,9 @@ fn battle_tag_constant_time_comparison() {
 fn battle_mask_webrtc_preset_valid() {
     let mask = webrtc_zoom_v3();
     assert_eq!(mask.mask_id, "webrtc_zoom_v3");
-    assert_eq!(mask.header_template.len(), 4);
+    assert_eq!(mask.data_mdh_len(), 20);
+    assert_eq!(mask.eph_pub_offset, 20);
+    assert_eq!(mask.handshake_mdh_len(), 52);
     assert_eq!(mask.eph_pub_length, 32);
     assert!(!mask.fsm_states.is_empty());
 }
@@ -616,7 +620,41 @@ fn battle_mask_webrtc_preset_valid() {
 fn battle_mask_quic_preset_valid() {
     let mask = quic_https_v2();
     assert_eq!(mask.mask_id, "quic_https_v2");
-    assert_eq!(mask.header_template.len(), 4);
+    assert_eq!(mask.data_mdh_len(), 14);
+    assert_eq!(mask.eph_pub_offset, 14);
+    assert_eq!(mask.handshake_mdh_len(), 46);
+}
+
+#[test]
+fn battle_bootstrap_fallback_masks_are_server_bootstrap_compatible() {
+    let masks = bootstrap_fallback_masks();
+    let ids: Vec<&str> = masks.iter().map(|mask| mask.mask_id.as_str()).collect();
+
+    assert_eq!(
+        ids,
+        vec![
+            "webrtc_zoom_v3",
+            "webrtc_yandex_telemost_v1",
+            "quic_https_v2",
+            "webrtc_vk_teams_v1",
+            "quic_grease_v1",
+            "webrtc_sberjazz_v1",
+        ]
+    );
+    for mask in masks {
+        assert_eq!(mask.eph_pub_length, 32);
+        assert!(mask.handshake_mdh_len() >= mask.data_mdh_len());
+        assert!(mask.handshake_mdh_len() >= mask.eph_pub_offset as usize + 32);
+        assert!(!mask.fsm_states.is_empty());
+
+        let mut mdh = mask.header_template.clone();
+        mdh.resize(mask.handshake_mdh_len(), 0);
+        let eph_pub = [0xA5; 32];
+        let offset = mask.eph_pub_offset as usize;
+        mdh[offset..offset + 32].copy_from_slice(&eph_pub);
+        assert!(mask.matches_mdh_prefix(&mdh));
+        assert_eq!(mask.copy_eph_pub_from_mdh(&mdh).unwrap(), eph_pub);
+    }
 }
 
 #[test]

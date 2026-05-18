@@ -1068,7 +1068,7 @@ fn test_neural_cleanup_stats() {
 #[test]
 fn test_mask_catalog_init() {
     let catalog = MaskCatalog::new();
-    assert_eq!(catalog.available_count(), 2, "Catalog must have 2 built-in masks");
+    assert_eq!(catalog.available_count(), 6, "Catalog must have 6 built-in masks");
 }
 
 #[test]
@@ -1077,18 +1077,18 @@ fn test_mask_catalog_register() {
     let mut custom_mask = webrtc_zoom_v3();
     custom_mask.mask_id = "custom_dns_tunnel_v1".to_string();
     catalog.register_mask(custom_mask);
-    assert_eq!(catalog.available_count(), 3, "Catalog must have 3 masks after registration");
+    assert_eq!(catalog.available_count(), 7, "Catalog must have 7 masks after registration");
 }
 
 #[test]
 fn test_mask_catalog_compromised() {
     let catalog = MaskCatalog::new();
     catalog.mark_compromised("webrtc_zoom_v3");
-    assert_eq!(catalog.available_count(), 1, "One mask left after compromise");
+    assert_eq!(catalog.available_count(), 5, "Five masks left after compromise");
     // Compromised mask should not be re-registered
     let mask = webrtc_zoom_v3();
     catalog.register_mask(mask);
-    assert_eq!(catalog.available_count(), 1, "Compromised mask must not be re-registered");
+    assert_eq!(catalog.available_count(), 5, "Compromised mask must not be re-registered");
 }
 
 #[test]
@@ -1096,14 +1096,22 @@ fn test_mask_catalog_select_fallback() {
     let catalog = MaskCatalog::new();
     let fallback = catalog.select_fallback("webrtc_zoom_v3");
     assert!(fallback.is_some(), "Must have a fallback mask");
-    assert_eq!(fallback.unwrap().mask_id, "quic_https_v2", "Fallback must be the other mask");
+    assert_eq!(
+        fallback.unwrap().mask_id,
+        "webrtc_yandex_telemost_v1",
+        "Fallback must follow bootstrap priority"
+    );
 }
 
 #[test]
 fn test_mask_catalog_no_fallback_when_all_compromised() {
     let catalog = MaskCatalog::new();
     catalog.mark_compromised("webrtc_zoom_v3");
+    catalog.mark_compromised("webrtc_yandex_telemost_v1");
+    catalog.mark_compromised("webrtc_vk_teams_v1");
+    catalog.mark_compromised("webrtc_sberjazz_v1");
     catalog.mark_compromised("quic_https_v2");
+    catalog.mark_compromised("quic_grease_v1");
     let fallback = catalog.select_fallback("anything");
     assert!(fallback.is_none(), "No fallback when all masks compromised");
     assert_eq!(catalog.available_count(), 0);

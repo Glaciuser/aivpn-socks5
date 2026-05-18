@@ -25,7 +25,7 @@ use aivpn_common::protocol::{
     InnerType, InnerHeader, ControlPayload, ControlSubtype,
     MAX_PACKET_SIZE,
 };
-use aivpn_common::mask::MaskProfile;
+use aivpn_common::mask::{preset_masks, MaskProfile};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::network_config::VpnNetworkConfig;
 
@@ -38,6 +38,13 @@ use crate::client_db::ClientDatabase;
 struct QueuedPacket {
     packet_data: Vec<u8>,
     client_addr: SocketAddr,
+}
+
+#[derive(Clone)]
+struct BootstrapMaskCandidate {
+    mask: MaskProfile,
+    eph_pub: [u8; 32],
+    handshake_mdh_len: usize,
 }
 
 /// Gateway configuration
@@ -92,16 +99,14 @@ pub struct MaskCatalog {
 
 impl MaskCatalog {
     pub fn new() -> Self {
-        use aivpn_common::mask::preset_masks;
         let catalog = Self {
             masks: DashMap::new(),
             compromised: DashMap::new(),
         };
         // Seed with built-in masks
-        let m1 = preset_masks::webrtc_zoom_v3();
-        let m2 = preset_masks::quic_https_v2();
-        catalog.masks.insert(m1.mask_id.clone(), m1);
-        catalog.masks.insert(m2.mask_id.clone(), m2);
+        for mask in preset_masks::bootstrap_fallback_masks() {
+            catalog.masks.insert(mask.mask_id.clone(), mask);
+        }
         catalog
     }
 
@@ -120,8 +125,18 @@ impl MaskCatalog {
 
     /// Select the best non-compromised mask, excluding `current_mask_id`
     pub fn select_fallback(&self, current_mask_id: &str) -> Option<MaskProfile> {
-        self.masks.iter()
-            .filter(|e| e.key() != current_mask_id)
+        for mask in preset_masks::bootstrap_fallback_masks() {
+            if mask.mask_id == current_mask_id {
+                continue;
+            }
+            if let Some(entry) = self.masks.get(&mask.mask_id) {
+                return Some(entry.value().clone());
+            }
+        }
+
+        self.masks
+            .iter()
+            .filter(|e| e.key().as_str() != current_mask_id)
             .map(|e| e.value().clone())
             .next()
     }
@@ -499,7 +514,7 @@ impl Gateway {
         tun_writer: tokio::sync::mpsc::Sender<Vec<u8>>,
         sessions: Arc<SessionManager>,
         socket: Arc<UdpSocket>,
-        mask: MaskProfile,
+        _mask: MaskProfile,
         server_vpn_ip: Ipv4Addr,
     ) {
         let mut buf = vec![0u8; MAX_PACKET_SIZE];
@@ -544,6 +559,7 @@ impl Gateway {
                         let (nonce, counter) = sess.next_send_nonce();
                         let key = sess.keys.session_key.clone();
                         let tag_secret = sess.keys.tag_secret;
+                        let mdh = Self::session_mdh_template(&sess);
                         drop(sess); // Release lock BEFORE expensive encryption
                         
                         // Build inner payload: Data type + IP packet
@@ -553,9 +569,6 @@ impl Gateway {
                         };
                         let mut inner_payload = inner_header.encode().to_vec();
                         inner_payload.extend_from_slice(packet);
-                        
-                        // Build MDH (no eph_pub for data packets)
-                        let mdh = mask.header_template.clone();
                         
                         // Pad and encrypt (outside lock)
                         let pad_len: u16 = 0;
@@ -723,6 +736,56 @@ impl Gateway {
         (key as usize) % worker_count
     }
 
+    fn session_data_mdh_len(session: &Session) -> usize {
+        session
+            .mask
+            .as_ref()
+            .map(MaskProfile::data_mdh_len)
+            .unwrap_or(4)
+    }
+
+    fn session_handshake_mdh_len(session: &Session) -> usize {
+        session
+            .mask
+            .as_ref()
+            .map(MaskProfile::handshake_mdh_len)
+            .unwrap_or(36)
+    }
+
+    fn session_mdh_template(session: &Session) -> Vec<u8> {
+        session
+            .mask
+            .as_ref()
+            .map(|mask| mask.header_template.clone())
+            .unwrap_or_else(|| vec![0u8; 4])
+    }
+
+    fn bootstrap_mask_candidates(packet_data: &[u8], server_public_key: &[u8; 32]) -> Vec<BootstrapMaskCandidate> {
+        let mut candidates = Vec::new();
+
+        for mask in preset_masks::bootstrap_fallback_masks() {
+            let handshake_mdh_len = mask.handshake_mdh_len();
+            let Some(mdh) = packet_data.get(TAG_SIZE..TAG_SIZE + handshake_mdh_len) else {
+                continue;
+            };
+            if !mask.matches_mdh_prefix(mdh) {
+                continue;
+            }
+
+            let Some(mut eph_pub) = mask.copy_eph_pub_from_mdh(mdh) else {
+                continue;
+            };
+            crypto::obfuscate_eph_pub(&mut eph_pub, server_public_key);
+            candidates.push(BootstrapMaskCandidate {
+                mask,
+                eph_pub,
+                handshake_mdh_len,
+            });
+        }
+
+        candidates
+    }
+
     /// Concurrent packet processing loop with shard workers.
     /// Packets for the same session stay on the same worker and preserve order,
     /// while different sessions can be processed in parallel.
@@ -837,8 +900,8 @@ impl Gateway {
         tag.copy_from_slice(&packet_data[0..TAG_SIZE]);
         
         // O(1) tag validation - find session
-        let mdh_len = 4; // Default for MVP
         let mut is_new_session = false;
+        let mut new_session_handshake_mdh_len = None;
         let (session, counter, is_ratcheted_tag) = if let Some(session) = self.session_manager.get_session_by_tag(&tag) {
             // Existing session — validate tag
             let (counter, is_ratcheted) = {
@@ -877,50 +940,64 @@ impl Gateway {
                 }
             }
 
-            // Try to establish a new one from eph_pub in MDH
-            if packet_data.len() < TAG_SIZE + mdh_len + 32 {
-                return Err(Error::InvalidPacket("Too short for session init"));
+            // Try to establish a new one from eph_pub embedded in a known bootstrap MDH.
+            let bootstrap_candidates = Self::bootstrap_mask_candidates(
+                packet_data,
+                &self.session_manager.server_public_key(),
+            );
+            if bootstrap_candidates.is_empty() {
+                return Err(Error::InvalidPacket("No known bootstrap mask matched session init"));
             }
-            let eph_start = TAG_SIZE + mdh_len;
-            if packet_data.len() < eph_start + 32 {
-                return Err(Error::InvalidPacket("Missing eph_pub for new session"));
-            }
-            let mut eph_pub = [0u8; 32];
-            eph_pub.copy_from_slice(&packet_data[eph_start..eph_start + 32]);
-            
-            // Deobfuscate eph_pub (HIGH-9)
-            crypto::obfuscate_eph_pub(&mut eph_pub, &self.session_manager.server_public_key());
             
             // Try to create session with each registered client's PSK.
             // If client_db is configured, iterate registered clients and try
             // DH + PSK to find one whose derived tags match.
             // Falls back to no-PSK for backward compatibility.
-            let (session, matched_client_id) = if let Some(ref db) = self.client_db {
+            let (
+                session,
+                matched_client_id,
+                selected_mask_id,
+                selected_handshake_mdh_len,
+                counter,
+                is_ratcheted,
+            ) = if let Some(ref db) = self.client_db {
                 let clients = db.list_clients();
                 let mut found = None;
-                for client_cfg in &clients {
-                    if !client_cfg.enabled { continue; }
-                    let psk = client_cfg.psk;
-                    match self.session_manager.create_session(
-                        client_addr,
-                        eph_pub,
-                        Some(psk),
-                        Some(client_cfg.vpn_ip),
-                    ) {
-                        Ok(sess) => {
-                            let validation = sess.lock().validate_tag(&tag);
-                            if validation.is_some() {
-                                found = Some((sess, Some(client_cfg.id.clone())));
-                                break;
-                            } else {
-                                // PSK mismatch — rollback this attempt
-                                let sid = sess.lock().session_id;
-                                self.session_manager.rollback_failed_session(&sid);
-                            }
-                        }
-                        Err(e) => {
-                            debug!("create_session failed: {}", e);
+                'candidate_loop: for candidate in &bootstrap_candidates {
+                    for client_cfg in &clients {
+                        if !client_cfg.enabled {
                             continue;
+                        }
+                        let psk = client_cfg.psk;
+                        match self.session_manager.create_session(
+                            client_addr,
+                            candidate.eph_pub,
+                            Some(psk),
+                            Some(client_cfg.vpn_ip),
+                        ) {
+                            Ok(sess) => {
+                                let validation = sess.lock().validate_tag(&tag);
+                                if let Some((counter, is_ratcheted)) = validation {
+                                    sess.lock().mask = Some(candidate.mask.clone());
+                                    found = Some((
+                                        sess,
+                                        Some(client_cfg.id.clone()),
+                                        candidate.mask.mask_id.clone(),
+                                        candidate.handshake_mdh_len,
+                                        counter,
+                                        is_ratcheted,
+                                    ));
+                                    break 'candidate_loop;
+                                } else {
+                                // PSK mismatch — rollback this attempt
+                                    let sid = sess.lock().session_id;
+                                    self.session_manager.rollback_failed_session(&sid);
+                                }
+                            }
+                            Err(e) => {
+                                debug!("create_session failed: {}", e);
+                                continue;
+                            }
                         }
                     }
                 }
@@ -945,28 +1022,34 @@ impl Gateway {
                 }
             } else {
                 // No client DB — legacy mode without PSK
-                let sess = self.session_manager.create_session(
-                    client_addr,
-                    eph_pub,
-                    None,
-                    None,
-                )?;
-                (sess, None)
-            };
-            
-            // Validate the tag against the session.
-            let validation = {
-                let sess = session.lock();
-                sess.validate_tag(&tag)
-            };
-            let (counter, is_ratcheted) = match validation {
-                Some(result) => result,
-                None => {
-                    let session_id = session.lock().session_id;
+                let mut found = None;
+                for candidate in &bootstrap_candidates {
+                    let sess = self.session_manager.create_session(
+                        client_addr,
+                        candidate.eph_pub,
+                        None,
+                        None,
+                    )?;
+                    let validation = sess.lock().validate_tag(&tag);
+                    if let Some((counter, is_ratcheted)) = validation {
+                        sess.lock().mask = Some(candidate.mask.clone());
+                        found = Some((
+                            sess,
+                            None,
+                            candidate.mask.mask_id.clone(),
+                            candidate.handshake_mdh_len,
+                            counter,
+                            is_ratcheted,
+                        ));
+                        break;
+                    }
+
+                    let session_id = sess.lock().session_id;
                     self.session_manager.rollback_failed_session(&session_id);
-                    return Err(Error::InvalidPacket("Tag mismatch on new session"));
                 }
+                found.ok_or(Error::InvalidPacket("No bootstrap mask matches this handshake"))?
             };
+            new_session_handshake_mdh_len = Some(selected_handshake_mdh_len);
             
             // Tag is valid — this is a real handshake.
             // Clean up old sessions for the SAME CLIENT (by VPN IP), not
@@ -1002,7 +1085,11 @@ impl Gateway {
             // which was encrypted with pre-ratchet keys.
             
             is_new_session = true;
-            info!("New session from {} (ServerHello sent)", hash_addr(&client_addr));
+            info!(
+                "New session from {} using bootstrap mask {} (ServerHello sent)",
+                hash_addr(&client_addr),
+                selected_mask_id,
+            );
             (session, counter, is_ratcheted)
         };
         
@@ -1012,34 +1099,55 @@ impl Gateway {
         // exists, those retries validate against the existing tag window, so
         // we must continue skipping eph_pub before decryption until ratchet
         // completes.
-        let is_pre_ratchet_retry = !is_new_session && !is_ratcheted_tag && {
+        let (data_mdh_len, handshake_mdh_len, session_is_ratcheted) = {
             let sess = session.lock();
-            !sess.is_ratcheted && packet_data.len() >= TAG_SIZE + mdh_len + 32 + 16
+            (
+                Self::session_data_mdh_len(&sess),
+                Self::session_handshake_mdh_len(&sess),
+                sess.is_ratcheted,
+            )
         };
-        let payload_offset = if is_new_session || is_pre_ratchet_retry {
-            TAG_SIZE + mdh_len + 32
+
+        let mut payload_offsets = Vec::with_capacity(2);
+        if is_new_session {
+            payload_offsets.push(TAG_SIZE + new_session_handshake_mdh_len.unwrap_or(handshake_mdh_len));
         } else {
-            TAG_SIZE + mdh_len
-        };
-        if packet_data.len() <= payload_offset {
-            return Err(Error::InvalidPacket("Invalid length"));
+            payload_offsets.push(TAG_SIZE + data_mdh_len);
+            if !is_ratcheted_tag && !session_is_ratcheted && handshake_mdh_len != data_mdh_len {
+                payload_offsets.push(TAG_SIZE + handshake_mdh_len);
+            }
         }
-        
-        // Decrypt with appropriate keys (initial or ratcheted)
-        let encrypted_payload = &packet_data[payload_offset..];
-        
-        let padded_plaintext = {
-            let sess = session.lock();
-            let nonce = self.compute_nonce(counter);
-            let key = if is_ratcheted_tag {
-                &sess.ratcheted_keys.as_ref()
-                    .ok_or(Error::InvalidPacket("Ratcheted keys missing"))?
-                    .session_key
-            } else {
-                &sess.keys.session_key
+
+        let nonce = self.compute_nonce(counter);
+        let mut decrypted_packet = None;
+        for payload_offset in payload_offsets {
+            if packet_data.len() <= payload_offset {
+                continue;
+            }
+
+            let encrypted_payload = &packet_data[payload_offset..];
+            let key = {
+                let sess = session.lock();
+                if is_ratcheted_tag {
+                    sess.ratcheted_keys
+                        .as_ref()
+                        .ok_or(Error::InvalidPacket("Ratcheted keys missing"))?
+                        .session_key
+                } else {
+                    sess.keys.session_key
+                }
             };
-            decrypt_payload(key, &nonce, encrypted_payload)?
+
+            if let Ok(padded_plaintext) = decrypt_payload(&key, &nonce, encrypted_payload) {
+                decrypted_packet = Some((payload_offset, padded_plaintext));
+                break;
+            }
+        }
+
+        let Some((payload_offset, padded_plaintext)) = decrypted_packet else {
+            return Err(Error::InvalidPacket("Invalid length or ciphertext for MDH"));
         };
+        let encrypted_payload = &packet_data[payload_offset..];
         
         // Complete PFS ratchet only when the CLIENT proves it has ratcheted
         // by sending a packet with ratcheted-key tags.
@@ -1362,8 +1470,7 @@ impl Gateway {
             time_window,
         );
         
-        // Build MDH (simple for MVP)
-        let mdh = vec![0u8; 4];
+        let mdh = Self::session_mdh_template(&sess);
         
         // Assemble packet: TAG | MDH | ciphertext (no cleartext padding)
         let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());

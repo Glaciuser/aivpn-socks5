@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-pub const DEFAULT_VPN_MTU: u16 = 1346;
+pub const DEFAULT_VPN_MTU: u16 = 1322;
 pub const LEGACY_VPN_PREFIX_LEN: u8 = 24;
 pub const LEGACY_SERVER_VPN_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 

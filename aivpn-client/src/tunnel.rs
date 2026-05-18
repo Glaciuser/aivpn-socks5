@@ -11,10 +11,10 @@ use aivpn_common::error::{Error, Result};
 use aivpn_common::network_config::{ClientNetworkConfig, LEGACY_SERVER_VPN_IP, VpnNetworkConfig};
 
 // Keep the full encrypted outer datagram within SAFE_OUTER_PACKET_BUDGET=1380.
-// Outer overhead is 34 bytes: TAG(16) + MDH(4) + pad_len(2) + Poly1305(16) -
+// Outer overhead is 54 bytes: TAG(16) + MDH(20) + pad_len(2) + Poly1305(16) -
 // the inner header is part of the plaintext payload, so the TUN MTU must leave
 // room for it as well.
-const WAN_SAFE_TUN_MTU: u16 = 1346;
+const WAN_SAFE_TUN_MTU: u16 = 1322;
 /// Tunnel configuration
 #[derive(Debug, Clone)]
 pub struct TunnelConfig {

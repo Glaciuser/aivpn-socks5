@@ -238,6 +238,46 @@ pub enum TransitionCondition {
 }
 
 impl MaskProfile {
+    /// MDH length for regular packets that do not carry a client eph_pub.
+    pub fn data_mdh_len(&self) -> usize {
+        self.header_template.len()
+    }
+
+    /// MDH length for bootstrap packets that carry a client eph_pub in the MDH.
+    pub fn handshake_mdh_len(&self) -> usize {
+        self.header_template.len().max(
+            self.eph_pub_offset as usize + self.eph_pub_length as usize,
+        )
+    }
+
+    pub fn matches_mdh_prefix(&self, mdh: &[u8]) -> bool {
+        if mdh.len() < self.header_template.len() {
+            return false;
+        }
+
+        let eph_start = self.eph_pub_offset as usize;
+        let eph_end = eph_start.saturating_add(self.eph_pub_length as usize);
+        self.header_template
+            .iter()
+            .enumerate()
+            .all(|(idx, expected)| {
+                (idx >= eph_start && idx < eph_end) || mdh[idx] == *expected
+            })
+    }
+
+    pub fn copy_eph_pub_from_mdh(&self, mdh: &[u8]) -> Option<[u8; 32]> {
+        if self.eph_pub_length != 32 {
+            return None;
+        }
+
+        let eph_start = self.eph_pub_offset as usize;
+        let eph_end = eph_start.checked_add(32)?;
+        let eph = mdh.get(eph_start..eph_end)?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(eph);
+        Some(out)
+    }
+
     /// Verify Ed25519 signature over all profile fields except the signature itself
     pub fn verify_signature(&self, public_key: &[u8; 32]) -> Result<bool> {
         use ed25519_dalek::{Signature, VerifyingKey, Verifier};
@@ -302,12 +342,15 @@ pub mod preset_masks {
     pub fn webrtc_zoom_v3() -> MaskProfile {
         MaskProfile {
             mask_id: "webrtc_zoom_v3".to_string(),
-            version: 1,
+            version: 2,
             created_at: 0,
             expires_at: u64::MAX,
             spoof_protocol: SpoofProtocol::WebRTC_STUN,
-            header_template: vec![0x00, 0x01, 0x02, 0x03], // STUN-like
-            eph_pub_offset: 4,
+            header_template: vec![
+                0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42, 0x7F, 0xB2, 0x7B, 0x94,
+                0x16, 0x02, 0xD0, 0x1D, 0x9C, 0x5B, 0x2D, 0xCB,
+            ],
+            eph_pub_offset: 20,
             eph_pub_length: 32,
             size_distribution: SizeDistribution {
                 dist_type: SizeDistType::Parametric,
@@ -350,12 +393,15 @@ pub mod preset_masks {
     pub fn quic_https_v2() -> MaskProfile {
         MaskProfile {
             mask_id: "quic_https_v2".to_string(),
-            version: 1,
+            version: 2,
             created_at: 0,
             expires_at: u64::MAX,
             spoof_protocol: SpoofProtocol::QUIC,
-            header_template: vec![0xC0, 0xFF, 0xEE, 0x00], // QUIC-like
-            eph_pub_offset: 4,
+            header_template: vec![
+                0xC0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x49, 0x8E, 0x38, 0xC9, 0x0F, 0x58,
+                0xC5, 0x2A,
+            ],
+            eph_pub_offset: 14,
             eph_pub_length: 32,
             size_distribution: SizeDistribution {
                 dist_type: SizeDistType::Histogram,
@@ -384,5 +430,233 @@ pub mod preset_masks {
             reverse_profile: None,
             signature: [0u8; 64],
         }
+    }
+
+    /// Yandex Telemost/WebRTC-like bootstrap profile.
+    pub fn webrtc_yandex_telemost_v1() -> MaskProfile {
+        MaskProfile {
+            mask_id: "webrtc_yandex_telemost_v1".to_string(),
+            version: 2,
+            created_at: 0,
+            expires_at: u64::MAX,
+            spoof_protocol: SpoofProtocol::WebRTC_STUN,
+            header_template: vec![
+                0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42, 0x9C, 0x2A, 0xBD, 0x49,
+                0xD3, 0x58, 0x0E, 0x93, 0x3E, 0xCD, 0x1F, 0x77,
+            ],
+            eph_pub_offset: 20,
+            eph_pub_length: 32,
+            size_distribution: SizeDistribution {
+                dist_type: SizeDistType::Parametric,
+                bins: vec![],
+                parametric_type: Some(ParametricType::Bimodal),
+                parametric_params: Some(vec![4.5, 0.45]),
+            },
+            iat_distribution: IATDistribution {
+                dist_type: IATDistType::LogNormal,
+                params: vec![2.3, 0.25],
+                jitter_range_ms: (3.0, 15.0),
+            },
+            padding_strategy: PaddingStrategy::RandomUniform { min: 0, max: 48 },
+            fsm_states: vec![
+                FSMState {
+                    state_id: 0,
+                    transitions: vec![FSMTransition {
+                        condition: TransitionCondition::AfterDuration(4000),
+                        next_state: 1,
+                        size_override: None,
+                        iat_override: None,
+                        padding_override: None,
+                    }],
+                },
+                FSMState {
+                    state_id: 1,
+                    transitions: vec![],
+                },
+            ],
+            fsm_initial_state: 0,
+            signature_vector: vec![0.0; 64],
+            reverse_profile: None,
+            signature: [0u8; 64],
+        }
+    }
+
+    /// VK Teams/WebRTC-like bootstrap profile.
+    pub fn webrtc_vk_teams_v1() -> MaskProfile {
+        MaskProfile {
+            mask_id: "webrtc_vk_teams_v1".to_string(),
+            version: 2,
+            created_at: 0,
+            expires_at: u64::MAX,
+            spoof_protocol: SpoofProtocol::WebRTC_STUN,
+            header_template: vec![
+                0x00, 0x01, 0x00, 0x01, 0x21, 0x12, 0xA4, 0x42, 0xCB, 0x0E, 0xA7, 0x5C,
+                0x26, 0xB9, 0x47, 0x7C, 0x31, 0xD9, 0x56, 0x0F,
+            ],
+            eph_pub_offset: 20,
+            eph_pub_length: 32,
+            size_distribution: SizeDistribution {
+                dist_type: SizeDistType::Histogram,
+                bins: vec![
+                    (64, 128, 0.15),
+                    (256, 512, 0.50),
+                    (768, 1024, 0.25),
+                    (1024, 1400, 0.10),
+                ],
+                parametric_type: None,
+                parametric_params: None,
+            },
+            iat_distribution: IATDistribution {
+                dist_type: IATDistType::LogNormal,
+                params: vec![2.8, 0.35],
+                jitter_range_ms: (5.0, 25.0),
+            },
+            padding_strategy: PaddingStrategy::RandomUniform { min: 0, max: 64 },
+            fsm_states: vec![
+                FSMState {
+                    state_id: 0,
+                    transitions: vec![FSMTransition {
+                        condition: TransitionCondition::AfterDuration(6000),
+                        next_state: 1,
+                        size_override: None,
+                        iat_override: None,
+                        padding_override: None,
+                    }],
+                },
+                FSMState {
+                    state_id: 1,
+                    transitions: vec![FSMTransition {
+                        condition: TransitionCondition::AfterPackets(50),
+                        next_state: 2,
+                        size_override: None,
+                        iat_override: None,
+                        padding_override: None,
+                    }],
+                },
+                FSMState {
+                    state_id: 2,
+                    transitions: vec![],
+                },
+            ],
+            fsm_initial_state: 0,
+            signature_vector: vec![0.0; 64],
+            reverse_profile: None,
+            signature: [0u8; 64],
+        }
+    }
+
+    /// SberJazz/WebRTC-like bootstrap profile.
+    pub fn webrtc_sberjazz_v1() -> MaskProfile {
+        MaskProfile {
+            mask_id: "webrtc_sberjazz_v1".to_string(),
+            version: 2,
+            created_at: 0,
+            expires_at: u64::MAX,
+            spoof_protocol: SpoofProtocol::WebRTC_STUN,
+            header_template: vec![
+                0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42, 0x59, 0xC9, 0x4D, 0x86,
+                0x2D, 0xA7, 0x16, 0x62, 0xAD, 0x37, 0x8D, 0xD2,
+            ],
+            eph_pub_offset: 20,
+            eph_pub_length: 32,
+            size_distribution: SizeDistribution {
+                dist_type: SizeDistType::Parametric,
+                bins: vec![],
+                parametric_type: Some(ParametricType::Bimodal),
+                parametric_params: Some(vec![5.5, 0.55]),
+            },
+            iat_distribution: IATDistribution {
+                dist_type: IATDistType::Exponential,
+                params: vec![0.08],
+                jitter_range_ms: (2.0, 12.0),
+            },
+            padding_strategy: PaddingStrategy::RandomUniform { min: 0, max: 32 },
+            fsm_states: vec![
+                FSMState {
+                    state_id: 0,
+                    transitions: vec![FSMTransition {
+                        condition: TransitionCondition::AfterDuration(3000),
+                        next_state: 1,
+                        size_override: None,
+                        iat_override: None,
+                        padding_override: None,
+                    }],
+                },
+                FSMState {
+                    state_id: 1,
+                    transitions: vec![],
+                },
+            ],
+            fsm_initial_state: 0,
+            signature_vector: vec![0.0; 64],
+            reverse_profile: None,
+            signature: [0u8; 64],
+        }
+    }
+
+    /// QUIC-like bootstrap profile with a different long-header byte pattern.
+    pub fn quic_grease_v1() -> MaskProfile {
+        MaskProfile {
+            mask_id: "quic_grease_v1".to_string(),
+            version: 1,
+            created_at: 0,
+            expires_at: u64::MAX,
+            spoof_protocol: SpoofProtocol::QUIC,
+            header_template: vec![0xC3, 0x00, 0x00, 0x01],
+            eph_pub_offset: 4,
+            eph_pub_length: 32,
+            size_distribution: SizeDistribution {
+                dist_type: SizeDistType::Histogram,
+                bins: vec![
+                    (88, 180, 0.2),
+                    (512, 980, 0.45),
+                    (1000, 1320, 0.35),
+                ],
+                parametric_type: None,
+                parametric_params: None,
+            },
+            iat_distribution: IATDistribution {
+                dist_type: IATDistType::Exponential,
+                params: vec![0.08],
+                jitter_range_ms: (0.0, 16.0),
+            },
+            padding_strategy: PaddingStrategy::MatchDistribution,
+            fsm_states: vec![
+                FSMState {
+                    state_id: 0,
+                    transitions: vec![FSMTransition {
+                        condition: TransitionCondition::AfterPackets(16),
+                        next_state: 1,
+                        size_override: None,
+                        iat_override: Some(IATDistribution {
+                            dist_type: IATDistType::Exponential,
+                            params: vec![0.14],
+                            jitter_range_ms: (0.0, 8.0),
+                        }),
+                        padding_override: None,
+                    }],
+                },
+                FSMState {
+                    state_id: 1,
+                    transitions: vec![],
+                },
+            ],
+            fsm_initial_state: 0,
+            signature_vector: vec![0.0; 64],
+            reverse_profile: None,
+            signature: [0u8; 64],
+        }
+    }
+
+    /// Built-in masks that can be used for initial handshake fallback.
+    pub fn bootstrap_fallback_masks() -> Vec<MaskProfile> {
+        vec![
+            webrtc_zoom_v3(),
+            webrtc_yandex_telemost_v1(),
+            quic_https_v2(),
+            webrtc_vk_teams_v1(),
+            quic_grease_v1(),
+            webrtc_sberjazz_v1(),
+        ]
     }
 }
