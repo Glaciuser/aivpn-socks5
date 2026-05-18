@@ -2,21 +2,24 @@
 
 use std::fs;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aivpn_client::AivpnClient;
 use aivpn_client::client::{ClientConfig, ClientMode};
-use aivpn_client::local_socks::{
-    LocalSocks5Config, LocalSocks5Runtime, spawn_local_socks5_server,
+use aivpn_client::local_socks::{spawn_local_socks5_server, LocalSocks5Config, LocalSocks5Runtime};
+use aivpn_client::sing_box::{
+    generate_openwrt_config, SingBoxConfigOptions, SingBoxEndpoint, SingBoxTransportMode,
+    DEFAULT_SING_BOX_LISTEN_HOST, DEFAULT_SING_BOX_LISTEN_PORT,
 };
 use aivpn_client::tunnel::TunnelConfig;
+use aivpn_client::AivpnClient;
 use aivpn_common::error::{Error, Result};
-use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
-use aivpn_common::network_config::{
-    ClientNetworkConfig, DEFAULT_VPN_MTU, LEGACY_SERVER_VPN_IP,
+use aivpn_common::mask::{
+    preset_masks::{quic_https_v2, webrtc_zoom_v3},
+    MaskProfile,
 };
+use aivpn_common::network_config::{ClientNetworkConfig, DEFAULT_VPN_MTU, LEGACY_SERVER_VPN_IP};
 use base64::Engine;
 use clap::{ArgAction, Parser, ValueEnum};
 use rand::Rng;
@@ -26,6 +29,7 @@ use tracing::{error, info, warn};
 
 const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const RECONNECT_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(30);
+const SERVER_HANDSHAKE_TIMEOUT_MARKER: &str = "Server handshake timeout";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -119,6 +123,18 @@ struct ClientArgs {
     #[arg(long)]
     local_socks5_max_concurrent_dials: Option<usize>,
 
+    /// Print an OpenWrt sing-box config for the selected transport and exit
+    #[arg(long, action = ArgAction::SetTrue)]
+    print_sing_box_config: bool,
+
+    /// sing-box local mixed inbound host for generated OpenWrt config
+    #[arg(long)]
+    sing_box_listen_host: Option<String>,
+
+    /// sing-box local mixed inbound port for generated OpenWrt config
+    #[arg(long)]
+    sing_box_listen_port: Option<u16>,
+
     /// Log level: error, warn, info, debug, trace
     #[arg(long, value_enum)]
     log_level: Option<LogLevel>,
@@ -175,6 +191,19 @@ async fn main() {
 
     init_logging(&args, &file_config);
 
+    if args.print_sing_box_config {
+        match render_openwrt_sing_box_config(&args, &file_config) {
+            Ok(config) => {
+                println!("{config}");
+                return;
+            }
+            Err(err) => {
+                error!("{err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let settings = match resolve_runtime_settings_with_file_config(&args, &file_config) {
         Ok(settings) => settings,
         Err(err) => {
@@ -213,7 +242,8 @@ async fn main() {
             .unwrap_or_else(|| LocalSocks5Config::default().max_concurrent_dials),
     ));
     let mut local_socks5_task = match settings.local_socks5.clone() {
-        Some(config) => match spawn_local_socks5_server(config, local_socks5_runtime.clone()).await {
+        Some(config) => match spawn_local_socks5_server(config, local_socks5_runtime.clone()).await
+        {
             Ok(task) => Some(task),
             Err(err) => {
                 error!("Failed to start local SOCKS5 listener: {err}");
@@ -230,6 +260,8 @@ async fn main() {
         Duration::from_secs(60)
     };
     let mut reconnect_attempt: u32 = 0;
+    let handshake_masks = handshake_fallback_masks();
+    let mut handshake_mask_index = 0usize;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -241,11 +273,14 @@ async fn main() {
             report_listener_failure(handle).await;
         }
 
+        let initial_mask = handshake_masks[handshake_mask_index].clone();
+        info!("Initial handshake mask: {}", initial_mask.mask_id);
+
         let config = ClientConfig {
             server_addr: settings.connection.server_addr.clone(),
             server_public_key: settings.connection.server_public_key,
             preshared_key: settings.connection.preshared_key,
-            initial_mask: webrtc_zoom_v3(),
+            initial_mask,
             tun_config: TunnelConfig::from_network_config(
                 settings.tun_name.clone(),
                 settings.connection.network_config,
@@ -282,8 +317,25 @@ async fn main() {
                         let local_socks_requested_reconnect = settings.mode == RuntimeMode::Socks5
                             && err_text.contains("Local SOCKS5")
                             && err_text.contains("reconnect");
+                        let handshake_timeout = is_server_handshake_timeout(&err_text);
 
-                        if local_socks_requested_reconnect || run_elapsed >= RECONNECT_BACKOFF_RESET_AFTER {
+                        if handshake_timeout {
+                            let previous_mask =
+                                handshake_masks[handshake_mask_index].mask_id.clone();
+                            handshake_mask_index =
+                                (handshake_mask_index + 1) % handshake_masks.len();
+                            let next_mask = &handshake_masks[handshake_mask_index].mask_id;
+                            warn!(
+                                "Server handshake timed out; switching initial mask {} -> {} and reconnecting immediately",
+                                previous_mask,
+                                next_mask
+                            );
+                            reconnect_delay = Duration::ZERO;
+                            advance_backoff = false;
+                            backoff = INITIAL_RECONNECT_BACKOFF;
+                        } else if local_socks_requested_reconnect
+                            || run_elapsed >= RECONNECT_BACKOFF_RESET_AFTER
+                        {
                             reconnect_delay = Duration::ZERO;
                             advance_backoff = false;
                             backoff = INITIAL_RECONNECT_BACKOFF;
@@ -330,6 +382,14 @@ async fn main() {
 fn resolve_runtime_settings(args: &ClientArgs) -> Result<RuntimeSettings> {
     let file_config = load_file_config(args.config.as_deref())?;
     resolve_runtime_settings_with_file_config(args, &file_config)
+}
+
+fn handshake_fallback_masks() -> Vec<MaskProfile> {
+    vec![webrtc_zoom_v3(), quic_https_v2()]
+}
+
+fn is_server_handshake_timeout(err_text: &str) -> bool {
+    err_text.contains(SERVER_HANDSHAKE_TIMEOUT_MARKER)
 }
 
 fn resolve_runtime_settings_with_file_config(
@@ -381,9 +441,8 @@ fn resolve_log_filter(
         return tracing_subscriber::EnvFilter::new(level.as_filter());
     }
 
-    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(LogLevel::Info.as_filter())
-    })
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(LogLevel::Info.as_filter()))
 }
 
 fn resolve_configured_log_level(
@@ -405,9 +464,8 @@ fn load_file_config(path: Option<&str>) -> Result<FileClientConfig> {
         ))
     })?;
 
-    serde_json::from_str(&raw).map_err(|err| {
-        Error::Session(format!("Failed to parse config file {path}: {err}"))
-    })
+    serde_json::from_str(&raw)
+        .map_err(|err| Error::Session(format!("Failed to parse config file {path}: {err}")))
 }
 
 fn resolve_local_socks5_config(
@@ -443,10 +501,59 @@ fn resolve_local_socks5_config(
             if let Some(max_concurrent_dials) = args.local_socks5_max_concurrent_dials {
                 config.max_concurrent_dials = max_concurrent_dials;
             }
-            config.validate()?;
+            config.validate_values()?;
             Ok(Some(config))
         }
     }
+}
+
+fn render_openwrt_sing_box_config(
+    args: &ClientArgs,
+    file_config: &FileClientConfig,
+) -> Result<String> {
+    let options = resolve_openwrt_sing_box_config(args, file_config)?;
+    let config = generate_openwrt_config(&options);
+    serde_json::to_string_pretty(&config)
+        .map_err(|err| Error::Session(format!("Failed to render sing-box config: {err}")))
+}
+
+fn resolve_openwrt_sing_box_config(
+    args: &ClientArgs,
+    file_config: &FileClientConfig,
+) -> Result<SingBoxConfigOptions> {
+    let mode = args
+        .mode
+        .or(file_config.mode)
+        .unwrap_or(RuntimeMode::Socks5);
+    let mut local_socks5 = file_config.local_socks5.clone().unwrap_or_default();
+    if let Some(host) = &args.local_socks5_host {
+        local_socks5.host = host.clone();
+    }
+    if let Some(port) = args.local_socks5_port {
+        local_socks5.port = port;
+    }
+    if let Some(max_clients) = args.local_socks5_max_clients {
+        local_socks5.max_clients = max_clients;
+    }
+    if let Some(max_concurrent_dials) = args.local_socks5_max_concurrent_dials {
+        local_socks5.max_concurrent_dials = max_concurrent_dials;
+    }
+    local_socks5.validate_values()?;
+
+    let mut options = SingBoxConfigOptions::openwrt_socks5(&local_socks5);
+    options.transport_mode = match mode {
+        RuntimeMode::Tun => SingBoxTransportMode::Tun,
+        RuntimeMode::Socks5 => SingBoxTransportMode::Socks5,
+    };
+    options.listen = SingBoxEndpoint::new(
+        args.sing_box_listen_host
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SING_BOX_LISTEN_HOST.to_string()),
+        args.sing_box_listen_port
+            .unwrap_or(DEFAULT_SING_BOX_LISTEN_PORT),
+    );
+
+    Ok(options)
 }
 
 fn resolve_connection_settings(
@@ -479,18 +586,14 @@ fn resolve_explicit_connection(
         .clone()
         .or_else(|| file_config.server_addr.clone())
         .ok_or_else(|| {
-            Error::Session(
-                "Either --connection-key or --server + --server-key is required".into(),
-            )
+            Error::Session("Either --connection-key or --server + --server-key is required".into())
         })?;
     let server_key_b64 = args
         .server_key
         .clone()
         .or_else(|| file_config.server_public_key.clone())
         .ok_or_else(|| {
-            Error::Session(
-                "Either --connection-key or --server + --server-key is required".into(),
-            )
+            Error::Session("Either --connection-key or --server + --server-key is required".into())
         })?;
     let server_public_key = decode_base64_key("server public key", &server_key_b64)?;
     let preshared_key = file_config
@@ -510,7 +613,10 @@ fn resolve_explicit_connection(
     })
 }
 
-fn parse_connection_key(connection_key: &str, fallback_tun_addr: &str) -> Result<ConnectionSettings> {
+fn parse_connection_key(
+    connection_key: &str,
+    fallback_tun_addr: &str,
+) -> Result<ConnectionSettings> {
     let payload = connection_key
         .trim()
         .strip_prefix("aivpn://")
@@ -539,12 +645,14 @@ fn parse_connection_key(connection_key: &str, fallback_tun_addr: &str) -> Result
         .and_then(|value| serde_json::from_value::<ClientNetworkConfig>(value).ok())
         .or_else(|| {
             json["i"].as_str().and_then(|ip| {
-                ip.parse::<Ipv4Addr>().ok().map(|client_ip| ClientNetworkConfig {
-                    client_ip,
-                    server_vpn_ip: LEGACY_SERVER_VPN_IP,
-                    prefix_len: 24,
-                    mtu: DEFAULT_VPN_MTU,
-                })
+                ip.parse::<Ipv4Addr>()
+                    .ok()
+                    .map(|client_ip| ClientNetworkConfig {
+                        client_ip,
+                        server_vpn_ip: LEGACY_SERVER_VPN_IP,
+                        prefix_len: 24,
+                        mtu: DEFAULT_VPN_MTU,
+                    })
             })
         })
         .unwrap_or_else(|| fallback_network_config(fallback_tun_addr));
@@ -635,6 +743,9 @@ mod tests {
             local_socks5_port: None,
             local_socks5_max_clients: None,
             local_socks5_max_concurrent_dials: None,
+            print_sing_box_config: false,
+            sing_box_listen_host: None,
+            sing_box_listen_port: None,
             log_level: None,
             config: None,
         };
@@ -657,6 +768,9 @@ mod tests {
             local_socks5_port: None,
             local_socks5_max_clients: None,
             local_socks5_max_concurrent_dials: None,
+            print_sing_box_config: false,
+            sing_box_listen_host: None,
+            sing_box_listen_port: None,
             log_level: None,
             config: None,
         };
@@ -667,6 +781,64 @@ mod tests {
         assert_eq!(local_socks5.port, 1080);
         assert_eq!(local_socks5.max_clients, 1024);
         assert_eq!(local_socks5.max_concurrent_dials, 512);
+    }
+
+    #[test]
+    fn default_tun_mode_keeps_local_socks_disabled() {
+        let args = ClientArgs {
+            server: Some("1.2.3.4:443".into()),
+            server_key: Some(base64::engine::general_purpose::STANDARD.encode([7u8; 32])),
+            connection_key: None,
+            mode: None,
+            tun_name: None,
+            tun_addr: None,
+            full_tunnel: false,
+            local_socks5_host: None,
+            local_socks5_port: None,
+            local_socks5_max_clients: None,
+            local_socks5_max_concurrent_dials: None,
+            print_sing_box_config: false,
+            sing_box_listen_host: None,
+            sing_box_listen_port: None,
+            log_level: None,
+            config: None,
+        };
+
+        let settings = resolve_runtime_settings(&args).unwrap();
+
+        assert_eq!(settings.mode, RuntimeMode::Tun);
+        assert!(settings.local_socks5.is_none());
+        assert!(!settings.full_tunnel);
+    }
+
+    #[test]
+    fn sing_box_config_generation_does_not_require_connection_settings() {
+        let args = ClientArgs {
+            server: None,
+            server_key: None,
+            connection_key: None,
+            mode: Some(RuntimeMode::Socks5),
+            tun_name: None,
+            tun_addr: None,
+            full_tunnel: false,
+            local_socks5_host: Some("127.0.0.1".into()),
+            local_socks5_port: Some(11080),
+            local_socks5_max_clients: None,
+            local_socks5_max_concurrent_dials: None,
+            print_sing_box_config: true,
+            sing_box_listen_host: Some("127.0.0.1".into()),
+            sing_box_listen_port: Some(2081),
+            log_level: None,
+            config: None,
+        };
+
+        let rendered = render_openwrt_sing_box_config(&args, &FileClientConfig::default()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(json["inbounds"][0]["type"], "mixed");
+        assert_eq!(json["inbounds"][0]["listen_port"], 2081);
+        assert_eq!(json["outbounds"][0]["type"], "socks");
+        assert_eq!(json["outbounds"][0]["server_port"], 11080);
     }
 
     #[test]
@@ -683,6 +855,9 @@ mod tests {
             local_socks5_port: None,
             local_socks5_max_clients: None,
             local_socks5_max_concurrent_dials: None,
+            print_sing_box_config: false,
+            sing_box_listen_host: None,
+            sing_box_listen_port: None,
             log_level: Some(LogLevel::Warn),
             config: None,
         };
@@ -711,6 +886,9 @@ mod tests {
             local_socks5_port: None,
             local_socks5_max_clients: None,
             local_socks5_max_concurrent_dials: None,
+            print_sing_box_config: false,
+            sing_box_listen_host: None,
+            sing_box_listen_port: None,
             log_level: None,
             config: None,
         };
@@ -725,4 +903,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn server_handshake_timeout_triggers_mask_fallback() {
+        assert!(is_server_handshake_timeout(
+            "Session error: Server handshake timeout after 20s without ServerHello"
+        ));
+        assert!(!is_server_handshake_timeout(
+            "Local SOCKS5 connectivity failures requested a client reconnect"
+        ));
+    }
+
+    #[test]
+    fn handshake_fallback_masks_match_server_bootstrap_parser() {
+        let masks = handshake_fallback_masks();
+        let ids: Vec<&str> = masks.iter().map(|mask| mask.mask_id.as_str()).collect();
+
+        assert_eq!(ids, vec!["webrtc_zoom_v3", "quic_https_v2"]);
+        for mask in masks {
+            assert_eq!(mask.header_template.len(), 4);
+            assert_eq!(mask.eph_pub_offset, 4);
+            assert_eq!(mask.eph_pub_length, 32);
+        }
+    }
 }

@@ -8,13 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
-use tokio::time;
 use crate::client_wire::{build_inner_packet, build_zero_mdh_packet};
 use crate::crypto::SessionKeys;
 use crate::error::{Error, Result};
 use crate::protocol::{ControlPayload, InnerType};
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::time;
 
 // ──────────── Configuration ────────────
 
@@ -23,7 +23,10 @@ pub struct UploadConfig {
     /// Maximum additional packets to drain from the channel after the first
     /// recv without yielding back to the async executor.
     pub burst_size: usize,
-    /// How often a keepalive is sent when there is no data traffic.
+    /// How often a health keepalive is sent.
+    ///
+    /// Keepalives are allowed to preempt data once their interval is due so
+    /// tunnel liveness checks do not starve behind a saturated upload queue.
     pub keepalive_interval: Duration,
     /// Optional interval for retransmitting the session-init control packet
     /// until the caller marks the server handshake complete.
@@ -137,8 +140,9 @@ async fn optional_interval_tick(interval: &mut Option<time::Interval>) {
 }
 
 /// Run the upload loop: pull TUN packets from `rx`, encrypt via `enc`, send
-/// over `udp`. Uses biased `select!` to prioritise data over keepalives and a
-/// burst-drain after the first recv to amortise per-packet scheduler overhead.
+/// over `udp`. Uses biased `select!` to keep handshake retries and health
+/// keepalives from starving behind data, plus a burst-drain after the first
+/// recv to amortise per-packet scheduler overhead.
 ///
 /// Returns `Err` on fatal I/O or channel close. Never returns `Ok` — the
 /// caller is expected to `.abort()` the task when the session ends.
@@ -175,6 +179,18 @@ pub async fn run_upload_loop(
                 send_tolerant(udp, &encrypted).await?;
             }
 
+            // Health keepalive. Keep this above data: local SOCKS reconnect
+            // heuristics rely on inbound server traffic, and a busy upload
+            // queue must not suppress keepalive ACKs indefinitely.
+            _ = ka_interval.tick() => {
+                let encrypted = if should_retry_handshake {
+                    enc.encrypt_handshake_retry()?
+                } else {
+                    enc.encrypt_keepalive()?
+                };
+                send_tolerant(udp, &encrypted).await?;
+            }
+
             // ── Data path ──
             maybe_pkt = rx.recv() => {
                 let pkt_data = match maybe_pkt {
@@ -204,15 +220,77 @@ pub async fn run_upload_loop(
                 }
             }
 
-            // ── Keepalive (fires only when data path is idle) ──
-            _ = ka_interval.tick() => {
-                let encrypted = if should_retry_handshake {
-                    enc.encrypt_handshake_retry()?
-                } else {
-                    enc.encrypt_keepalive()?
-                };
-                send_tolerant(udp, &encrypted).await?;
-            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::net::UdpSocket;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    struct SlowDataEncryptor;
+
+    impl PacketEncryptor for SlowDataEncryptor {
+        fn encrypt_data(&mut self, _payload: &[u8]) -> Result<Vec<u8>> {
+            std::thread::sleep(Duration::from_millis(2));
+            Ok(vec![b'D'])
+        }
+
+        fn encrypt_keepalive(&mut self) -> Result<Vec<u8>> {
+            Ok(vec![b'K'])
+        }
+
+        fn on_data_sent(&mut self, _payload_len: usize) {}
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_preempts_saturated_data_queue() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .connect(receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+        let sender = Arc::new(sender);
+
+        let (tx, mut rx) = mpsc::channel(1024);
+        for _ in 0..1024 {
+            tx.send(vec![1]).await.unwrap();
+        }
+
+        let mut enc = SlowDataEncryptor;
+        let config = UploadConfig {
+            burst_size: 0,
+            keepalive_interval: Duration::from_millis(5),
+            handshake_retry_interval: None,
+            handshake_complete: None,
+        };
+        let task =
+            tokio::spawn(async move { run_upload_loop(&mut rx, &sender, &mut enc, &config).await });
+
+        let mut buf = [0u8; 1];
+        let saw_keepalive = timeout(Duration::from_millis(250), async {
+            loop {
+                let n = receiver.recv(&mut buf).await.unwrap();
+                if n == 1 && buf[0] == b'K' {
+                    break true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        task.abort();
+        assert!(
+            saw_keepalive,
+            "keepalive should be sent even while data is continuously ready"
+        );
     }
 }

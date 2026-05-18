@@ -1,22 +1,22 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant as TokioInstant, sleep, sleep_until, timeout};
+use tokio::time::{sleep, sleep_until, timeout, Instant as TokioInstant};
 use tracing::{debug, info, warn};
 
+use crate::netns::NetworkNamespace;
 use aivpn_common::crypto;
 use aivpn_common::error::{Error, Result};
-use crate::netns::NetworkNamespace;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const SOCKS5_METHOD_NO_AUTH: u8 = 0x00;
@@ -97,7 +97,7 @@ impl Default for LocalSocks5Config {
 }
 
 impl LocalSocks5Config {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate_values(&self) -> Result<()> {
         if self.host.trim().is_empty() {
             return Err(Error::Session("Local SOCKS5 host cannot be empty".into()));
         }
@@ -111,6 +111,12 @@ impl LocalSocks5Config {
                 "Local SOCKS5 max_concurrent_dials must be greater than zero".into(),
             ));
         }
+
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_values()?;
 
         #[cfg(not(target_os = "linux"))]
         {
@@ -468,9 +474,8 @@ impl LocalSocks5Runtime {
 
         let now = Instant::now();
         let recent_server_packet_age = self.recent_server_packet_age();
-        let recent_server_activity = recent_server_packet_age.is_some_and(|age| {
-            age <= LOCAL_SOCKS5_TIMEOUT_RECONNECT_SERVER_ACTIVITY_GRACE
-        });
+        let recent_server_activity = recent_server_packet_age
+            .is_some_and(|age| age <= LOCAL_SOCKS5_TIMEOUT_RECONNECT_SERVER_ACTIVITY_GRACE);
         let mut streak_to_log = None;
         let mut reconnect_reason = None;
         let mut suppressed_due_to_server_activity = None;
@@ -640,8 +645,7 @@ pub async fn spawn_local_socks5_server(
                 Err(_) => {
                     warn!(
                         "Local SOCKS5 client slot queue is shutting down on {}; dropping {}",
-                        actual_addr,
-                        peer_addr
+                        actual_addr, peer_addr
                     );
                     drop(stream);
                     break;
@@ -651,9 +655,7 @@ pub async fn spawn_local_socks5_server(
             if permit_wait >= LOCAL_SOCKS5_CLIENT_SLOT_QUEUE_LOG_THRESHOLD {
                 info!(
                     "Local SOCKS5 waited {:?} for a client slot on {} before serving {}",
-                    permit_wait,
-                    actual_addr,
-                    peer_addr
+                    permit_wait, actual_addr, peer_addr
                 );
             };
 
@@ -703,7 +705,10 @@ async fn resolve_bind_addr(config: &LocalSocks5Config) -> Result<SocketAddr> {
         .ok_or_else(|| {
             Error::Io(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
-                format!("Could not resolve local SOCKS5 bind address {}", config.display_addr()),
+                format!(
+                    "Could not resolve local SOCKS5 bind address {}",
+                    config.display_addr()
+                ),
             ))
         })
 }
@@ -714,40 +719,22 @@ async fn handle_client(
     runtime: Arc<LocalSocks5Runtime>,
     session_id: u64,
 ) -> Result<()> {
-    let (command, target) = match timeout(
-        LOCAL_SOCKS5_HANDSHAKE_TIMEOUT,
-        read_request(&mut client),
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
-            return Err(Error::Session(format!(
-                "Local SOCKS5 handshake timed out after {}s",
-                LOCAL_SOCKS5_HANDSHAKE_TIMEOUT.as_secs()
-            )));
-        }
-    };
+    let (command, target) =
+        match timeout(LOCAL_SOCKS5_HANDSHAKE_TIMEOUT, read_request(&mut client)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(Error::Session(format!(
+                    "Local SOCKS5 handshake timed out after {}s",
+                    LOCAL_SOCKS5_HANDSHAKE_TIMEOUT.as_secs()
+                )));
+            }
+        };
     match command {
         SOCKS5_CMD_CONNECT => {
-            handle_connect(
-                &mut client,
-                target,
-                peer_addr,
-                runtime,
-                session_id,
-            )
-            .await
+            handle_connect(&mut client, target, peer_addr, runtime, session_id).await
         }
         SOCKS5_CMD_UDP_ASSOCIATE => {
-            handle_udp_associate(
-                &mut client,
-                target,
-                peer_addr,
-                runtime,
-                session_id,
-            )
-            .await
+            handle_udp_associate(&mut client, target, peer_addr, runtime, session_id).await
         }
         _ => {
             let reply_addr = unspecified_addr_for_peer(peer_addr);
@@ -828,28 +815,24 @@ async fn handle_connect(
         session_id, peer_addr, target_display
     );
 
-    let session_generation = match wait_for_dataplane_ready(
-        runtime.as_ref(),
-        session_id,
-        peer_addr,
-        &target_display,
-    )
-    .await
-    {
-        Some(generation) => generation,
-        None => {
-            let detail = format!(
-                "AIVPN tunnel is reconnecting or did not become ready within {}ms",
-                LOCAL_SOCKS5_READY_WAIT_TIMEOUT.as_millis()
-            );
-            runtime.observe_network_unreachable_reply(&target_display, peer_addr, &detail);
-            let reply_addr = unspecified_addr_for_peer(peer_addr);
-            send_reply(client, SOCKS5_REPLY_NETWORK_UNREACHABLE, reply_addr).await?;
-            return Err(Error::Session(
-                "AIVPN tunnel unavailable for local SOCKS5 CONNECT".into(),
-            ));
-        }
-    };
+    let session_generation =
+        match wait_for_dataplane_ready(runtime.as_ref(), session_id, peer_addr, &target_display)
+            .await
+        {
+            Some(generation) => generation,
+            None => {
+                let detail = format!(
+                    "AIVPN tunnel is reconnecting or did not become ready within {}ms",
+                    LOCAL_SOCKS5_READY_WAIT_TIMEOUT.as_millis()
+                );
+                runtime.observe_network_unreachable_reply(&target_display, peer_addr, &detail);
+                let reply_addr = unspecified_addr_for_peer(peer_addr);
+                send_reply(client, SOCKS5_REPLY_NETWORK_UNREACHABLE, reply_addr).await?;
+                return Err(Error::Session(
+                    "AIVPN tunnel unavailable for local SOCKS5 CONNECT".into(),
+                ));
+            }
+        };
 
     let queue_started = Instant::now();
     let available_before_queue = runtime.available_dial_slots();
@@ -894,14 +877,22 @@ async fn handle_connect(
             // `max_clients`, so release the dial slot before starting relay I/O.
             drop(dial_permit);
             send_reply(client, SOCKS5_REPLY_SUCCEEDED, bind_addr).await?;
-            relay_tcp_until_idle(client, &mut upstream, runtime, session_id, session_generation).await
+            relay_tcp_until_idle(
+                client,
+                &mut upstream,
+                runtime,
+                session_id,
+                session_generation,
+            )
+            .await
         }
         Err(connect_err) => {
             let dial_elapsed = dial_started.elapsed();
             let reply = map_error_to_reply(&connect_err.error);
             let reply_addr = unspecified_addr_for_peer(peer_addr);
             let _ = send_reply(client, reply, reply_addr).await;
-            if matches!(&connect_err.error, Error::Io(io_err) if io_err.kind() == io::ErrorKind::TimedOut) {
+            if matches!(&connect_err.error, Error::Io(io_err) if io_err.kind() == io::ErrorKind::TimedOut)
+            {
                 runtime.observe_connect_timeout(
                     &target_display,
                     peer_addr,
@@ -974,33 +965,27 @@ async fn handle_udp_associate(
     let target_display = target.display();
     debug!(
         "Local SOCKS5 session #{} UDP ASSOCIATE {} -> {}",
-        session_id,
-        peer_addr,
-        target_display
+        session_id, peer_addr, target_display
     );
 
-    let session_generation = match wait_for_dataplane_ready(
-        runtime.as_ref(),
-        session_id,
-        peer_addr,
-        &target_display,
-    )
-    .await
-    {
-        Some(generation) => generation,
-        None => {
-            let detail = format!(
-                "AIVPN tunnel is reconnecting or did not become ready within {}ms",
-                LOCAL_SOCKS5_READY_WAIT_TIMEOUT.as_millis()
-            );
-            runtime.observe_network_unreachable_reply(&target_display, peer_addr, &detail);
-            let reply_addr = unspecified_addr_for_peer(peer_addr);
-            send_reply(client, SOCKS5_REPLY_NETWORK_UNREACHABLE, reply_addr).await?;
-            return Err(Error::Session(
-                "AIVPN tunnel unavailable for local SOCKS5 UDP ASSOCIATE".into(),
-            ));
-        }
-    };
+    let session_generation =
+        match wait_for_dataplane_ready(runtime.as_ref(), session_id, peer_addr, &target_display)
+            .await
+        {
+            Some(generation) => generation,
+            None => {
+                let detail = format!(
+                    "AIVPN tunnel is reconnecting or did not become ready within {}ms",
+                    LOCAL_SOCKS5_READY_WAIT_TIMEOUT.as_millis()
+                );
+                runtime.observe_network_unreachable_reply(&target_display, peer_addr, &detail);
+                let reply_addr = unspecified_addr_for_peer(peer_addr);
+                send_reply(client, SOCKS5_REPLY_NETWORK_UNREACHABLE, reply_addr).await?;
+                return Err(Error::Session(
+                    "AIVPN tunnel unavailable for local SOCKS5 UDP ASSOCIATE".into(),
+                ));
+            }
+        };
 
     let client_bind_addr = client.local_addr().map_err(Error::Io)?;
     let relay_client = UdpSocket::bind(SocketAddr::new(client_bind_addr.ip(), 0))
@@ -1008,7 +993,8 @@ async fn handle_udp_associate(
         .map_err(Error::Io)?;
     let relay_reply_addr = relay_client.local_addr().map_err(Error::Io)?;
 
-    let relay_upstream = create_namespace_udp_socket(client_bind_addr.is_ipv4(), runtime.clone()).await?;
+    let relay_upstream =
+        create_namespace_udp_socket(client_bind_addr.is_ipv4(), runtime.clone()).await?;
     let relay_upstream_addr = relay_upstream.local_addr().map_err(Error::Io)?;
     debug!(
         "Local SOCKS5 UDP relay client={} upstream={}",
@@ -1297,12 +1283,9 @@ async fn connect_target(
             } else {
                 socket2::Domain::IPV6
             };
-            let socket = socket2::Socket::new(
-                domain,
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )
-            .map_err(Error::Io)?;
+            let socket =
+                socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+                    .map_err(Error::Io)?;
             socket.set_nonblocking(true).map_err(Error::Io)?;
             match socket.connect(&target_addr.into()) {
                 Ok(()) => {}
@@ -1341,24 +1324,24 @@ async fn connect_target(
             )),
         }
     })
-        .await
-        .map_err(|_| ConnectTargetFailure {
-            error: Error::Io(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "Timed out connecting to SOCKS5 target {} after {}s",
-                    target_display,
-                    LOCAL_SOCKS5_CONNECT_TIMEOUT.as_secs()
-                ),
-            )),
-            setup_elapsed,
-            connect_wait_elapsed: LOCAL_SOCKS5_CONNECT_TIMEOUT,
-        })?;
+    .await
+    .map_err(|_| ConnectTargetFailure {
+        error: Error::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "Timed out connecting to SOCKS5 target {} after {}s",
+                target_display,
+                LOCAL_SOCKS5_CONNECT_TIMEOUT.as_secs()
+            ),
+        )),
+        setup_elapsed,
+        connect_wait_elapsed: LOCAL_SOCKS5_CONNECT_TIMEOUT,
+    })?;
     connect_wait_result.map_err(|error| ConnectTargetFailure {
-            error,
-            setup_elapsed,
-            connect_wait_elapsed: connect_wait_started.elapsed(),
-        })?;
+        error,
+        setup_elapsed,
+        connect_wait_elapsed: connect_wait_started.elapsed(),
+    })?;
 
     if let Some(err) = stream.take_error().map_err(|err| ConnectTargetFailure {
         error: Error::Io(err),
@@ -1392,12 +1375,9 @@ async fn create_namespace_udp_socket(
                 socket2::Domain::IPV6
             };
 
-            let socket = socket2::Socket::new(
-                domain,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            )
-            .map_err(Error::Io)?;
+            let socket =
+                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+                    .map_err(Error::Io)?;
 
             socket.set_nonblocking(true).map_err(Error::Io)?;
 
@@ -1427,7 +1407,10 @@ fn is_temporary_dns_lookup_error(err: &io::Error) -> bool {
     message.contains("try again") || message.contains("temporary failure")
 }
 
-async fn resolve_target_addr(target: &TargetAddr, runtime: Arc<LocalSocks5Runtime>) -> Result<SocketAddr> {
+async fn resolve_target_addr(
+    target: &TargetAddr,
+    runtime: Arc<LocalSocks5Runtime>,
+) -> Result<SocketAddr> {
     match target {
         TargetAddr::Socket(addr) => Ok(*addr),
         TargetAddr::Domain(host, port) => {
@@ -1435,7 +1418,12 @@ async fn resolve_target_addr(target: &TargetAddr, runtime: Arc<LocalSocks5Runtim
                 return Ok(addr);
             }
 
-            match timeout(LOCAL_SOCKS5_DNS_RESOLVE_TIMEOUT, lookup_host((host.as_str(), *port))).await {
+            match timeout(
+                LOCAL_SOCKS5_DNS_RESOLVE_TIMEOUT,
+                lookup_host((host.as_str(), *port)),
+            )
+            .await
+            {
                 Ok(Ok(addrs)) => {
                     let resolved_addrs: Vec<_> = addrs.collect();
                     let first_addr = resolved_addrs.first().copied().ok_or_else(|| {
@@ -1546,7 +1534,9 @@ fn parse_udp_packet(packet: &[u8]) -> Result<(TargetAddr, &[u8])> {
         return Err(Error::InvalidPacket("SOCKS5 UDP packet has invalid RSV"));
     }
     if packet[2] != 0x00 {
-        return Err(Error::InvalidPacket("SOCKS5 UDP fragmentation is unsupported"));
+        return Err(Error::InvalidPacket(
+            "SOCKS5 UDP fragmentation is unsupported",
+        ));
     }
 
     let (target, header_len) = match packet[3] {
@@ -1575,7 +1565,9 @@ fn parse_udp_packet(packet: &[u8]) -> Result<(TargetAddr, &[u8])> {
         }
         SOCKS5_ATYP_DOMAIN => {
             let Some(host_len) = packet.get(4) else {
-                return Err(Error::InvalidPacket("SOCKS5 UDP domain packet missing length"));
+                return Err(Error::InvalidPacket(
+                    "SOCKS5 UDP domain packet missing length",
+                ));
             };
             let host_end = 5 + *host_len as usize;
             if packet.len() < host_end + 2 {
@@ -1726,11 +1718,7 @@ mod tests {
         let reconnect_generation = runtime.current_reconnect_generation();
 
         for _ in 0..LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
-            runtime.observe_connect_timeout(
-                "8.8.4.4:443",
-                peer_addr,
-                "simulated timeout",
-            );
+            runtime.observe_connect_timeout("8.8.4.4:443", peer_addr, "simulated timeout");
         }
 
         assert!(!runtime.is_ready());
@@ -1746,11 +1734,7 @@ mod tests {
         let reconnect_generation = runtime.current_reconnect_generation();
 
         for _ in 0..LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
-            runtime.observe_connect_timeout(
-                "8.8.4.4:443",
-                peer_addr,
-                "simulated timeout",
-            );
+            runtime.observe_connect_timeout("8.8.4.4:443", peer_addr, "simulated timeout");
         }
 
         assert!(runtime.is_ready());
@@ -1795,7 +1779,10 @@ mod tests {
             entry.stale_expires_at = Instant::now() + Duration::from_secs(30);
         }
 
-        assert_eq!(runtime.cached_target_addr("mask.icloud.com", 443, false), None);
+        assert_eq!(
+            runtime.cached_target_addr("mask.icloud.com", 443, false),
+            None
+        );
         assert_eq!(
             runtime.cached_target_addr("mask.icloud.com", 443, true),
             Some("17.253.31.201:443".parse().unwrap())
@@ -1804,12 +1791,10 @@ mod tests {
 
     #[test]
     fn relay_write_timeout_is_not_treated_as_benign_disconnect() {
-        assert!(!is_benign_client_disconnect(&Error::Session(
-            format!(
-                "Local SOCKS5 session #42 write to upstream timed out after {}s",
-                LOCAL_SOCKS5_TCP_RELAY_WRITE_TIMEOUT.as_secs()
-            ),
-        )));
+        assert!(!is_benign_client_disconnect(&Error::Session(format!(
+            "Local SOCKS5 session #42 write to upstream timed out after {}s",
+            LOCAL_SOCKS5_TCP_RELAY_WRITE_TIMEOUT.as_secs()
+        ),)));
     }
 
     #[tokio::test]

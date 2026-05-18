@@ -127,6 +127,18 @@ Example `client.json` for local SOCKS5 mode:
 }
 ```
 
+For OpenWrt `sing-box` sidecar use, generate or start from the deterministic
+SOCKS5-only config. It uses a `mixed` inbound and a SOCKS5 outbound to the
+local AIVPN listener, with no `tun`, `auto_route`, `auto_redirect`, firewall,
+or shell route sections:
+
+```sh
+./aivpn-client --mode socks5 --print-sing-box-config > /etc/sing-box/aivpn-socks5.json
+```
+
+The same checked-in example is available at
+[`config/sing-box-openwrt-socks5.json.example`](config/sing-box-openwrt-socks5.json.example).
+
 ### Quick Start (Android)
 1. Download and install `aivpn-client.apk`
 2. Paste your connection key (`aivpn://...`) into the app

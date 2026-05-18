@@ -39,7 +39,7 @@ use crate::tunnel::{Tunnel, TunnelConfig};
 
 const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const CLIENT_HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const SERVER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

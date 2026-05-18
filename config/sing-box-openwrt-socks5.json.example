@@ -1,0 +1,36 @@
+{
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "listen_port": 2080,
+      "set_system_proxy": false,
+      "tag": "mixed-in",
+      "type": "mixed"
+    }
+  ],
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "outbounds": [
+    {
+      "server": "127.0.0.1",
+      "server_port": 1080,
+      "tag": "aivpn-socks5",
+      "type": "socks",
+      "version": "5"
+    },
+    {
+      "tag": "direct",
+      "type": "direct"
+    },
+    {
+      "tag": "block",
+      "type": "block"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": false,
+    "final": "aivpn-socks5"
+  }
+}

@@ -1,5 +1,5 @@
 //! AIVPN Client Implementation
-//! 
+//!
 //! Client with:
 //! - TUN device for packet capture
 //! - Mimicry Engine for traffic shaping
@@ -9,6 +9,7 @@ pub mod client;
 pub mod local_socks;
 pub mod mimicry;
 pub mod netns;
+pub mod sing_box;
 pub mod tunnel;
 
 pub use client::AivpnClient;
