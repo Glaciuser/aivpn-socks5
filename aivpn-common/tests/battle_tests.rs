@@ -633,8 +633,8 @@ fn battle_bootstrap_fallback_masks_are_server_bootstrap_compatible() {
     assert_eq!(
         ids,
         vec![
-            "webrtc_zoom_v3",
             "webrtc_yandex_telemost_v1",
+            "webrtc_zoom_v3",
             "quic_https_v2",
             "webrtc_vk_teams_v1",
             "quic_grease_v1",

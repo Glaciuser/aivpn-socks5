@@ -651,8 +651,8 @@ pub mod preset_masks {
     /// Built-in masks that can be used for initial handshake fallback.
     pub fn bootstrap_fallback_masks() -> Vec<MaskProfile> {
         vec![
-            webrtc_zoom_v3(),
             webrtc_yandex_telemost_v1(),
+            webrtc_zoom_v3(),
             quic_https_v2(),
             webrtc_vk_teams_v1(),
             quic_grease_v1(),

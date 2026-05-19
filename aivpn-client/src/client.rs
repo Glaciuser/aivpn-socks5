@@ -39,6 +39,7 @@ use crate::tunnel::{Tunnel, TunnelConfig};
 
 const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const CLIENT_HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const CLIENT_UPLOAD_BURST_SIZE: usize = 15;
 const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const SERVER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -625,6 +626,7 @@ impl AivpnClient {
             bytes_sent,
         };
         let config = UploadConfig {
+            burst_size: CLIENT_UPLOAD_BURST_SIZE,
             keepalive_interval: CLIENT_KEEPALIVE_INTERVAL,
             handshake_retry_interval: Some(CLIENT_HANDSHAKE_RETRY_INTERVAL),
             handshake_complete: Some(server_handshake_complete),
@@ -650,6 +652,9 @@ impl AivpnClient {
             }
             Err(primary_err) => {
                 let Some(fallback_keys) = self.transition_recv_keys.as_ref() else {
+                    if Self::is_packet_auth_error(&primary_err) {
+                        return Err(Error::InvalidPacket("Packet authentication failed"));
+                    }
                     return Err(primary_err);
                 };
 
@@ -660,7 +665,12 @@ impl AivpnClient {
                     mdh_len,
                 ) {
                     Ok(decoded) => decoded,
-                    Err(_fallback_err) => return Err(primary_err),
+                    Err(_fallback_err) => {
+                        if Self::is_packet_auth_error(&primary_err) {
+                            return Err(Error::InvalidPacket("Packet authentication failed"));
+                        }
+                        return Err(primary_err);
+                    }
                 }
             }
         };
@@ -686,6 +696,10 @@ impl AivpnClient {
         }
 
         Ok(())
+    }
+
+    fn is_packet_auth_error(error: &Error) -> bool {
+        matches!(error, Error::Crypto(message) if message.contains("aead"))
     }
 
     /// Handle control messages from server

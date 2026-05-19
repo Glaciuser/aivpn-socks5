@@ -35,9 +35,10 @@ const SOCKS5_REPLY_CONNECTION_REFUSED: u8 = 0x05;
 const SOCKS5_REPLY_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 const DEFAULT_LOCAL_SOCKS5_MAX_CLIENTS: usize = 1024;
-const DEFAULT_LOCAL_SOCKS5_MAX_CONCURRENT_DIALS: usize = 512;
+const DEFAULT_LOCAL_SOCKS5_MAX_CONCURRENT_DIALS: usize = 64;
+const LOCAL_SOCKS5_MAX_CONCURRENT_DIALS_CEILING: usize = 64;
 const LOCAL_SOCKS5_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
-const LOCAL_SOCKS5_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
+const LOCAL_SOCKS5_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCAL_SOCKS5_READY_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 const LOCAL_SOCKS5_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCAL_SOCKS5_QUEUE_LOG_THRESHOLD: Duration = Duration::from_millis(250);
@@ -47,9 +48,10 @@ const LOCAL_SOCKS5_UDP_ASSOCIATE_IDLE_TIMEOUT: Duration = Duration::from_secs(60
 const LOCAL_SOCKS5_TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 const LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD: u32 = 8;
 const LOCAL_SOCKS5_FORCE_RECONNECT_WINDOW: Duration = Duration::from_secs(10);
-const LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD: u32 = 4;
-const LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW: Duration = Duration::from_secs(20);
+const LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD: u32 = 8;
+const LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW: Duration = Duration::from_secs(60);
 const LOCAL_SOCKS5_TIMEOUT_RECONNECT_SERVER_ACTIVITY_GRACE: Duration = Duration::from_secs(15);
+const LOCAL_SOCKS5_TIMEOUT_RECONNECT_MIN_SERVER_SILENCE: Duration = Duration::from_secs(75);
 const LOCAL_SOCKS5_DNS_CACHE_TTL: Duration = Duration::from_secs(60);
 const LOCAL_SOCKS5_DNS_CACHE_STALE_GRACE: Duration = Duration::from_secs(300);
 const LOCAL_SOCKS5_DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -187,6 +189,17 @@ struct ConnectTargetFailure {
 
 impl LocalSocks5Runtime {
     pub fn new(max_concurrent_dials: usize) -> Self {
+        let requested_max_concurrent_dials = max_concurrent_dials;
+        let max_concurrent_dials =
+            requested_max_concurrent_dials.min(LOCAL_SOCKS5_MAX_CONCURRENT_DIALS_CEILING);
+        if requested_max_concurrent_dials > max_concurrent_dials {
+            warn!(
+                "Local SOCKS5 max_concurrent_dials={} is above the stability cap {}; using {}",
+                requested_max_concurrent_dials,
+                LOCAL_SOCKS5_MAX_CONCURRENT_DIALS_CEILING,
+                max_concurrent_dials
+            );
+        }
         Self {
             ready: AtomicBool::new(false),
             ready_notify: Notify::new(),
@@ -208,6 +221,12 @@ impl LocalSocks5Runtime {
         self.ready.load(Ordering::SeqCst)
     }
 
+    fn is_ready_for_generation(&self, generation: u64) -> bool {
+        self.current_generation() == generation
+            && self.is_ready()
+            && self.current_generation() == generation
+    }
+
     pub fn set_ready(&self, ready: bool) {
         self.ready.store(ready, Ordering::SeqCst);
         if ready {
@@ -221,7 +240,17 @@ impl LocalSocks5Runtime {
     }
 
     pub async fn wait_until_ready(&self, wait_timeout: Duration) -> bool {
-        if self.is_ready() {
+        let generation = self.current_generation();
+        self.wait_until_ready_for_generation(wait_timeout, generation)
+            .await
+    }
+
+    pub async fn wait_until_ready_for_generation(
+        &self,
+        wait_timeout: Duration,
+        generation: u64,
+    ) -> bool {
+        if self.is_ready_for_generation(generation) {
             return true;
         }
 
@@ -230,14 +259,22 @@ impl LocalSocks5Runtime {
         tokio::pin!(sleep);
 
         loop {
-            let notified = self.ready_notify.notified();
-            if self.is_ready() {
+            let ready_notified = self.ready_notify.notified();
+            let reset_notified = self.reset_notify.notified();
+            if self.is_ready_for_generation(generation) {
                 return true;
             }
 
             tokio::select! {
-                _ = &mut sleep => return self.is_ready(),
-                _ = notified => {}
+                _ = &mut sleep => {
+                    return self.is_ready_for_generation(generation);
+                }
+                _ = ready_notified => {}
+                _ = reset_notified => {
+                    if self.current_generation() != generation {
+                        return false;
+                    }
+                }
             }
         }
     }
@@ -476,9 +513,13 @@ impl LocalSocks5Runtime {
         let recent_server_packet_age = self.recent_server_packet_age();
         let recent_server_activity = recent_server_packet_age
             .is_some_and(|age| age <= LOCAL_SOCKS5_TIMEOUT_RECONNECT_SERVER_ACTIVITY_GRACE);
+        let enough_server_silence = recent_server_packet_age
+            .map(|age| age >= LOCAL_SOCKS5_TIMEOUT_RECONNECT_MIN_SERVER_SILENCE)
+            .unwrap_or(true);
         let mut streak_to_log = None;
         let mut reconnect_reason = None;
         let mut suppressed_due_to_server_activity = None;
+        let mut suppressed_due_to_short_silence = None;
 
         if let Ok(mut diagnostics) = self.diagnostics.lock() {
             let reset_window = match diagnostics.ready_timeout_window_started_at {
@@ -507,12 +548,16 @@ impl LocalSocks5Runtime {
                     if streak == LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
                         suppressed_due_to_server_activity = recent_server_packet_age;
                     }
+                } else if !enough_server_silence {
+                    if streak == LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
+                        suppressed_due_to_short_silence = recent_server_packet_age;
+                    }
                 } else {
                     reconnect_reason = Some(format!(
                         "Local SOCKS5 saw {} ready-state connect timeouts within {:?} without inbound server traffic for at least {:?}; latest target {} from {}: {}",
                         streak,
                         LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW,
-                        recent_server_packet_age.unwrap_or(LOCAL_SOCKS5_TIMEOUT_RECONNECT_SERVER_ACTIVITY_GRACE),
+                        recent_server_packet_age.unwrap_or(LOCAL_SOCKS5_TIMEOUT_RECONNECT_MIN_SERVER_SILENCE),
                         target_display,
                         peer_addr,
                         detail
@@ -545,6 +590,19 @@ impl LocalSocks5Runtime {
                 LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD,
                 LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW,
                 server_packet_age,
+                target_display,
+                peer_addr,
+                detail
+            );
+        }
+
+        if let Some(server_packet_age) = suppressed_due_to_short_silence {
+            warn!(
+                "Local SOCKS5 kept the dataplane up after {} ready-state connect timeouts within {:?}; last inbound server packet was {:?} ago, below the {:?} reconnect floor. Latest target {} from {}: {}",
+                LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD,
+                LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW,
+                server_packet_age,
+                LOCAL_SOCKS5_TIMEOUT_RECONNECT_MIN_SERVER_SILENCE,
                 target_display,
                 peer_addr,
                 detail
@@ -928,13 +986,14 @@ async fn wait_for_dataplane_ready(
     peer_addr: SocketAddr,
     target_display: &str,
 ) -> Option<u64> {
-    if runtime.is_ready() {
-        return Some(runtime.current_generation());
+    let session_generation = runtime.current_generation();
+    if runtime.is_ready_for_generation(session_generation) {
+        return Some(session_generation);
     }
 
     let wait_started = Instant::now();
     let became_ready = runtime
-        .wait_until_ready(LOCAL_SOCKS5_READY_WAIT_TIMEOUT)
+        .wait_until_ready_for_generation(LOCAL_SOCKS5_READY_WAIT_TIMEOUT, session_generation)
         .await;
     let wait_elapsed = wait_started.elapsed();
 
@@ -952,7 +1011,7 @@ async fn wait_for_dataplane_ready(
         );
     }
 
-    Some(runtime.current_generation())
+    Some(session_generation)
 }
 
 async fn handle_udp_associate(
@@ -1675,6 +1734,16 @@ mod tests {
     }
 
     #[test]
+    fn runtime_caps_excessive_concurrent_dials() {
+        let runtime = LocalSocks5Runtime::new(512);
+
+        assert_eq!(
+            runtime.max_concurrent_dials(),
+            LOCAL_SOCKS5_MAX_CONCURRENT_DIALS_CEILING
+        );
+    }
+
+    #[test]
     fn runtime_requests_reconnect_after_ready_network_unreachable_burst() {
         let runtime = LocalSocks5Runtime::new(1);
         let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
@@ -1715,6 +1784,12 @@ mod tests {
         let runtime = LocalSocks5Runtime::new(1);
         let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         runtime.set_ready(true);
+        runtime.last_server_packet_at_ms.store(
+            crypto::current_timestamp_ms().saturating_sub(
+                LOCAL_SOCKS5_TIMEOUT_RECONNECT_MIN_SERVER_SILENCE.as_millis() as u64 + 1_000,
+            ),
+            Ordering::Relaxed,
+        );
         let reconnect_generation = runtime.current_reconnect_generation();
 
         for _ in 0..LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
@@ -1731,6 +1806,26 @@ mod tests {
         let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         runtime.set_ready(true);
         runtime.observe_server_packet();
+        let reconnect_generation = runtime.current_reconnect_generation();
+
+        for _ in 0..LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
+            runtime.observe_connect_timeout("8.8.4.4:443", peer_addr, "simulated timeout");
+        }
+
+        assert!(runtime.is_ready());
+        assert_eq!(runtime.current_reconnect_generation(), reconnect_generation);
+    }
+
+    #[test]
+    fn runtime_does_not_request_reconnect_after_timeout_burst_with_short_server_silence() {
+        let runtime = LocalSocks5Runtime::new(1);
+        let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        runtime.set_ready(true);
+        runtime.last_server_packet_at_ms.store(
+            crypto::current_timestamp_ms()
+                .saturating_sub(Duration::from_secs(31).as_millis() as u64),
+            Ordering::Relaxed,
+        );
         let reconnect_generation = runtime.current_reconnect_generation();
 
         for _ in 0..LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
@@ -1808,5 +1903,24 @@ mod tests {
         });
 
         assert!(runtime.wait_until_ready(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn runtime_wait_until_ready_for_generation_stops_on_reset() {
+        let runtime = Arc::new(LocalSocks5Runtime::new(1));
+        let generation = runtime.current_generation();
+        let runtime_for_task = runtime.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            runtime_for_task.reset_active_sessions();
+            runtime_for_task.set_ready(true);
+        });
+
+        assert!(
+            !runtime
+                .wait_until_ready_for_generation(Duration::from_secs(1), generation)
+                .await
+        );
     }
 }

@@ -777,7 +777,7 @@ mod tests {
         assert_eq!(local_socks5.host, "127.0.0.1");
         assert_eq!(local_socks5.port, 1080);
         assert_eq!(local_socks5.max_clients, 1024);
-        assert_eq!(local_socks5.max_concurrent_dials, 512);
+        assert_eq!(local_socks5.max_concurrent_dials, 64);
     }
 
     #[test]
@@ -918,8 +918,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "webrtc_zoom_v3",
                 "webrtc_yandex_telemost_v1",
+                "webrtc_zoom_v3",
                 "quic_https_v2",
                 "webrtc_vk_teams_v1",
                 "quic_grease_v1",

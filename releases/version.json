@@ -1,0 +1,72 @@
+﻿{
+    "version":  "0.3.0",
+    "generated_at":  "2026-05-19T21:45:21Z",
+    "assets":  {
+                   "linux-x86_64":  {
+                                        "file":  "aivpn-client-linux-x86_64",
+                                        "url":  "http://185.232.170.186:8080/aivpn-client-linux-x86_64",
+                                        "sha256":  "432e1fe3c53ca4696a56c8fa77952c3767e3ba77f0b1173301729766e01a1283",
+                                        "size":  4620888
+                                    },
+                   "openwrt-musl":  {
+                                        "file":  "aivpn-client-openwrt-musl",
+                                        "url":  "http://185.232.170.186:8080/aivpn-client-openwrt-musl",
+                                        "sha256":  "cc844890d244853b9a1f7f234dc448c3a3c9c0be23b69b0179aa49937402d01b",
+                                        "size":  4631688
+                                    },
+                   "linux-arm64":  {
+                                       "file":  "aivpn-client-linux-arm64",
+                                       "url":  "http://185.232.170.186:8080/aivpn-client-linux-arm64",
+                                       "sha256":  "3a0a083bfddda699c0239fe28798b3596800789c9107540302e09e363157c1ec",
+                                       "size":  4512528
+                                   },
+                   "linux-armv7":  {
+                                       "file":  "aivpn-client-linux-armv7-musleabihf",
+                                       "url":  "http://185.232.170.186:8080/aivpn-client-linux-armv7-musleabihf",
+                                       "sha256":  "7d483b938567595b5f20dd735673cef21a74fdad9c837edb697f3428bda78a29",
+                                       "size":  4268708
+                                   },
+                   "linux-mipsel":  {
+                                        "file":  "aivpn-client-linux-mipsel-musl",
+                                        "url":  "http://185.232.170.186:8080/aivpn-client-linux-mipsel-musl",
+                                        "sha256":  "711dbc1b82376b921b9f2d3598c84e53c1badea0713b646f4792e6b810d5ae4b",
+                                        "size":  5506016
+                                    },
+                   "windows-x86_64":  {
+                                          "file":  "aivpn-client.exe",
+                                          "url":  "http://185.232.170.186:8080/aivpn-client.exe",
+                                          "sha256":  "95e2d54f6d47a70928026a8da9b0b3cfe998d6d404c0b9d2d33b8dbb0d1a2aa2",
+                                          "size":  7285565
+                                      },
+                   "windows-package":  {
+                                           "file":  "aivpn-windows-package.zip",
+                                           "url":  "http://185.232.170.186:8080/aivpn-windows-package.zip",
+                                           "sha256":  "a737b9fbb5fe80dcd20e543f524e5c86d17bfed78150e93b174d6b991cf9decd",
+                                           "size":  8334167
+                                       },
+                   "macos-universal":  {
+                                           "file":  "aivpn-client-macos-universal",
+                                           "url":  "http://185.232.170.186:8080/aivpn-client-macos-universal",
+                                           "sha256":  "dadc9ceefbf93cf6fc8965b3c2fddb40691096499ea3c1d4d9ee10fcf80f3036",
+                                           "size":  9077684
+                                       },
+                   "macos-pkg":  {
+                                     "file":  "aivpn-macos.pkg",
+                                     "url":  "http://185.232.170.186:8080/aivpn-macos.pkg",
+                                     "sha256":  "e06f24b8c957bfd8ad0cf00cae4ad42f3ec227739cdfc50b4175634429deb2a7",
+                                     "size":  15372300
+                                 },
+                   "macos-dmg":  {
+                                     "file":  "aivpn-macos.dmg",
+                                     "url":  "http://185.232.170.186:8080/aivpn-macos.dmg",
+                                     "sha256":  "b28dcc11847d9f049a477f01dd145f1e0a78defb1a09b961b63479fbbb4ce432",
+                                     "size":  15747635
+                                 },
+                   "android-apk":  {
+                                       "file":  "aivpn-client.apk",
+                                       "url":  "http://185.232.170.186:8080/aivpn-client.apk",
+                                       "sha256":  "f1dba4d54ec60693925f1780c13f2059caadc566689d4859c7d403febe9fe97d",
+                                       "size":  7330603
+                                   }
+               }
+}

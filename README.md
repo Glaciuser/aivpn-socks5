@@ -122,7 +122,7 @@ Example `client.json` for local SOCKS5 mode:
     "host": "127.0.0.1",
     "port": 1080,
     "max_clients": 1024,
-    "max_concurrent_dials": 512
+    "max_concurrent_dials": 64
   }
 }
 ```
