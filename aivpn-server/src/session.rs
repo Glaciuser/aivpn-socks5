@@ -26,7 +26,9 @@ use aivpn_common::error::{Error, Result};
 /// Maximum sessions on 1GB VPS
 pub const MAX_SESSIONS: usize = 500;
 const MAX_SESSIONS_PER_IP: usize = 5;
-const STALE_PRE_RATCHET_SESSION_TIMEOUT: Duration = Duration::from_secs(45);
+// Client abandons a handshake after 8s; keep this below a full quick mask sweep
+// so lost ServerHello attempts cannot fill the per-IP pre-ratchet slots.
+const STALE_PRE_RATCHET_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Session idle timeout
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);

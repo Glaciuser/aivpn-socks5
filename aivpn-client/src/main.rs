@@ -259,6 +259,7 @@ async fn main() {
     let mut reconnect_attempt: u32 = 0;
     let handshake_masks = handshake_fallback_masks();
     let mut handshake_mask_index = 0usize;
+    let mut handshake_timeout_streak: u32 = 0;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -317,25 +318,40 @@ async fn main() {
                         let handshake_timeout = is_server_handshake_timeout(&err_text);
 
                         if handshake_timeout {
+                            handshake_timeout_streak = handshake_timeout_streak.saturating_add(1);
                             let previous_mask =
                                 handshake_masks[handshake_mask_index].mask_id.clone();
                             handshake_mask_index =
                                 (handshake_mask_index + 1) % handshake_masks.len();
                             let next_mask = &handshake_masks[handshake_mask_index].mask_id;
-                            warn!(
-                                "Server handshake timed out; switching initial mask {} -> {} and reconnecting immediately",
-                                previous_mask,
-                                next_mask
-                            );
-                            reconnect_delay = Duration::ZERO;
-                            advance_backoff = false;
-                            backoff = INITIAL_RECONNECT_BACKOFF;
+                            if completed_handshake_mask_sweep(
+                                handshake_timeout_streak,
+                                handshake_masks.len(),
+                            ) {
+                                warn!(
+                                    "Server handshake timed out on all {} bootstrap masks; backing off {}s before retrying with {}",
+                                    handshake_masks.len(),
+                                    reconnect_delay.as_secs(),
+                                    next_mask
+                                );
+                            } else {
+                                warn!(
+                                    "Server handshake timed out; switching initial mask {} -> {} and reconnecting immediately",
+                                    previous_mask,
+                                    next_mask
+                                );
+                                reconnect_delay = Duration::ZERO;
+                                advance_backoff = false;
+                            }
                         } else if local_socks_requested_reconnect
                             || run_elapsed >= RECONNECT_BACKOFF_RESET_AFTER
                         {
+                            handshake_timeout_streak = 0;
                             reconnect_delay = Duration::ZERO;
                             advance_backoff = false;
                             backoff = INITIAL_RECONNECT_BACKOFF;
+                        } else {
+                            handshake_timeout_streak = 0;
                         }
 
                         warn!(
@@ -387,6 +403,10 @@ fn handshake_fallback_masks() -> Vec<MaskProfile> {
 
 fn is_server_handshake_timeout(err_text: &str) -> bool {
     err_text.contains(SERVER_HANDSHAKE_TIMEOUT_MARKER)
+}
+
+fn completed_handshake_mask_sweep(timeout_streak: u32, mask_count: usize) -> bool {
+    mask_count > 0 && timeout_streak as usize % mask_count == 0
 }
 
 fn resolve_runtime_settings_with_file_config(
@@ -908,6 +928,15 @@ mod tests {
         assert!(!is_server_handshake_timeout(
             "Local SOCKS5 connectivity failures requested a client reconnect"
         ));
+    }
+
+    #[test]
+    fn server_handshake_timeout_backs_off_after_full_mask_sweep() {
+        assert!(!completed_handshake_mask_sweep(1, 6));
+        assert!(!completed_handshake_mask_sweep(5, 6));
+        assert!(completed_handshake_mask_sweep(6, 6));
+        assert!(completed_handshake_mask_sweep(12, 6));
+        assert!(!completed_handshake_mask_sweep(1, 0));
     }
 
     #[test]
